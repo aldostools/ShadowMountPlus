@@ -19,7 +19,6 @@
 
 // --- Configuration ---
 #define SCAN_INTERVAL_US    3000000 
-#define STABLE_WAIT_US      3000000 
 #define MAX_PENDING         512     
 #define MAX_PATH            1024
 #define MAX_TITLE_ID        32
@@ -50,15 +49,23 @@ void log_debug(const char* fmt, ...);
 typedef struct notify_request { char unused[45]; char message[3075]; } notify_request_t;
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 
+// Scan Paths
 const char* SCAN_PATHS[] = {
-    "/data/homebrew", 
-    "/mnt/usb0/homebrew", "/mnt/usb1/homebrew", "/mnt/usb2/homebrew",
-    "/mnt/usb3/homebrew", "/mnt/usb4/homebrew", "/mnt/usb5/homebrew", "/mnt/usb6/homebrew",
-    "/mnt/ext0/homebrew", "/mnt/ext1/homebrew",
-    "/data/etaHEN/games",
-    "/mnt/usb0/etaHEN/games", "/mnt/usb1/etaHEN/games", "/mnt/usb2/etaHEN/games",
-    "/mnt/usb3/etaHEN/games", "/mnt/usb4/etaHEN/games", "/mnt/usb5/etaHEN/games", "/mnt/usb6/etaHEN/games",
-    "/mnt/ext0/etaHEN/games", "/mnt/ext1/etaHEN/games",
+    // Internal
+    "/data/homebrew", "/data/etaHEN/games",
+    
+    // USB Subfolders
+    "/mnt/usb0/homebrew", "/mnt/usb1/homebrew", "/mnt/usb2/homebrew", "/mnt/usb3/homebrew",
+    "/mnt/usb4/homebrew", "/mnt/usb5/homebrew", "/mnt/usb6/homebrew", "/mnt/usb7/homebrew",
+    
+    "/mnt/usb0/etaHEN/games", "/mnt/usb1/etaHEN/games", "/mnt/usb2/etaHEN/games", "/mnt/usb3/etaHEN/games",
+    "/mnt/usb4/etaHEN/games", "/mnt/usb5/etaHEN/games", "/mnt/usb6/etaHEN/games", "/mnt/usb7/etaHEN/games",
+
+    // USB Root Paths
+    "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3",
+    "/mnt/usb4", "/mnt/usb5", "/mnt/usb6", "/mnt/usb7",
+    "/mnt/ext0", "/mnt/ext1",
+    
     NULL
 };
 
@@ -69,12 +76,6 @@ struct GameCache {
     bool valid; 
 };
 struct GameCache cache[MAX_PENDING];
-
-__attribute__((constructor)) static void sys_init(void) {
-    sceUserServiceInitialize(0);
-    kernel_set_ucred_authid(-1, 0x4801000000000013L);
-}
-__attribute__((destructor)) static void sys_fini(void) { sceUserServiceTerminate(); }
 
 // --- LOGGING ---
 void log_to_file(const char* fmt, va_list args) {
@@ -90,7 +91,7 @@ void log_debug(const char* fmt, ...) {
     va_list args; va_start(args, fmt); vprintf(fmt, args); printf("\n"); log_to_file(fmt, args); va_end(args);
 }
 
-// --- STANDARD NOTIFICATION ---
+// --- NOTIFICATIONS ---
 void notify_system(const char* fmt, ...) {
     notify_request_t req; memset(&req, 0, sizeof(req));
     va_list args; va_start(args, fmt); vsnprintf(req.message, sizeof(req.message), fmt, args); va_end(args);
@@ -98,14 +99,11 @@ void notify_system(const char* fmt, ...) {
     log_debug("NOTIFY: %s", req.message);
 }
 
-// --- RICH TOAST IPC ---
 void trigger_rich_toast(const char* title_id, const char* game_name, const char* msg) {
     FILE* f = fopen(TOAST_FILE, "w");
     if (f) {
         fprintf(f, "%s|%s|%s", title_id, game_name, msg);
-        fflush(f); 
-        fclose(f);
-        log_debug("IPC: Sent toast request for %s", game_name);
+        fflush(f); fclose(f);
     }
 }
 
@@ -113,40 +111,33 @@ void trigger_rich_toast(const char* title_id, const char* game_name, const char*
 bool is_installed(const char* title_id) { char path[MAX_PATH]; snprintf(path, sizeof(path), "/user/app/%s", title_id); struct stat st; return (stat(path, &st) == 0); }
 bool is_data_mounted(const char* title_id) { char path[MAX_PATH]; snprintf(path, sizeof(path), "/system_ex/app/%s/sce_sys/param.json", title_id); return (access(path, F_OK) == 0); }
 
-// --- RECURSION SAFETY ---
-off_t get_folder_size_recursive(const char* path, int depth) {
-    if (depth > 3) return 0; // Prevent stack overflow on massive games
-    off_t total = 0; DIR* d = opendir(path); if (!d) return 0;
-    struct dirent* entry; char full_path[MAX_PATH]; struct stat st;
-    while ((entry = readdir(d)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        if (stat(full_path, &st) == 0) { 
-            if (S_ISDIR(st.st_mode)) total += get_folder_size_recursive(full_path, depth + 1); 
-            else total += st.st_size; 
-        }
-    }
-    closedir(d); return total;
-}
+// --- FAST STABILITY CHECK ---
+bool wait_for_stability_fast(const char* path, const char* name) {
+    struct stat st;
+    time_t now = time(NULL);
 
-bool wait_for_stability(const char* path, const char* name) {
-    log_debug("  [DEBUG] Checking stability for %s...", name); 
-    off_t size1 = get_folder_size_recursive(path, 0);
-    if (size1 == 0) return false;
-    
-    int checks = 0;
-    while (true) {
-        sceKernelUsleep(STABLE_WAIT_US); 
-        off_t size2 = get_folder_size_recursive(path, 0);
-        if (size1 == size2 && size1 > 0) {
-            log_debug("  [DEBUG] Stable."); 
-            return true;
+    // 1. Check Root Folder Timestamp
+    if (stat(path, &st) != 0) return false; 
+    double diff = difftime(now, st.st_mtime);
+
+    // If modified > 10 seconds ago, it's stable.
+    if (diff > 10.0) {
+        // Double check sce_sys just to be sure
+        char sys_path[MAX_PATH];
+        snprintf(sys_path, sizeof(sys_path), "%s/sce_sys", path);
+        if (stat(sys_path, &st) == 0) {
+            if (difftime(now, st.st_mtime) > 10.0) {
+                 return true;
+            }
+        } else {
+             return true; // No sce_sys? Trust root.
         }
-        log_debug("  [WAIT] Copying %s... (%ld -> %ld)", name, size1, size2);
-        size1 = size2;
-        checks++;
-        if (checks > 100) return false; 
     }
+    
+    // If we are here, files were modified recently.
+    log_debug("  [WAIT] %s modified %.0fs ago. Waiting...", name, diff);
+    sceKernelUsleep(2000000); // Wait 2s
+    return false; // Force re-scan next cycle
 }
 
 static int remount_system_ex(void) {
@@ -232,7 +223,7 @@ bool get_game_info(const char* base_path, char* out_id, char* out_name) {
     return false;
 }
 
-// --- COUNTING PHASE ---
+// --- COUNTING ---
 int count_new_candidates() {
     int count = 0;
     for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
@@ -244,7 +235,8 @@ int count_new_candidates() {
 
             char title_id[MAX_TITLE_ID]; char title_name[MAX_TITLE_NAME];
             if (!get_game_info(full_path, title_id, title_name)) continue; 
-            
+            if (is_installed(title_id) && is_data_mounted(title_id)) continue; 
+
             bool already_seen = false;
             for(int k=0; k<MAX_PENDING; k++) {
                 if (cache[k].valid && strcmp(cache[k].path, full_path) == 0) { already_seen = true; break; }
@@ -258,7 +250,7 @@ int count_new_candidates() {
     return count;
 }
 
-bool mount_and_install(const char* src_path, const char* title_id, const char* title_name) {
+bool mount_and_install(const char* src_path, const char* title_id, const char* title_name, bool is_remount) {
     char system_ex_app[MAX_PATH]; char user_app_dir[MAX_PATH]; char user_sce_sys[MAX_PATH]; char src_sce_sys[MAX_PATH];
     
     // MOUNT
@@ -267,18 +259,22 @@ bool mount_and_install(const char* src_path, const char* title_id, const char* t
     if (mount_nullfs(src_path, system_ex_app) < 0) { log_debug("  [MOUNT] FAIL: %s", strerror(errno)); return false; }
 
     // COPY FILES
-    snprintf(user_app_dir, sizeof(user_app_dir), "/user/app/%s", title_id); 
-    snprintf(user_sce_sys, sizeof(user_sce_sys), "%s/sce_sys", user_app_dir);
-    mkdir(user_app_dir, 0777); 
-    mkdir(user_sce_sys, 0777);
+    if (!is_remount) {
+        snprintf(user_app_dir, sizeof(user_app_dir), "/user/app/%s", title_id); 
+        snprintf(user_sce_sys, sizeof(user_sce_sys), "%s/sce_sys", user_app_dir);
+        mkdir(user_app_dir, 0777); 
+        mkdir(user_sce_sys, 0777);
 
-    snprintf(src_sce_sys, sizeof(src_sce_sys), "%s/sce_sys", src_path); 
-    copy_dir(src_sce_sys, user_sce_sys); 
-    
-    char icon_src[MAX_PATH], icon_dst[MAX_PATH]; 
-    snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", src_path);
-    snprintf(icon_dst, sizeof(icon_dst), "/user/app/%s/icon0.png", title_id); 
-    copy_file(icon_src, icon_dst);
+        snprintf(src_sce_sys, sizeof(src_sce_sys), "%s/sce_sys", src_path); 
+        copy_dir(src_sce_sys, user_sce_sys); 
+        
+        char icon_src[MAX_PATH], icon_dst[MAX_PATH]; 
+        snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", src_path);
+        snprintf(icon_dst, sizeof(icon_dst), "/user/app/%s/icon0.png", title_id); 
+        copy_file(icon_src, icon_dst);
+    } else {
+        log_debug("  [SPEED] Skipping file copy (Assets already exist)");
+    }
 
     // WRITE TRACKER
     char lnk_path[MAX_PATH]; snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", title_id);
@@ -294,7 +290,7 @@ bool mount_and_install(const char* src_path, const char* title_id, const char* t
     }
     else if (res == 0x80990002) { 
         log_debug("  [REG] Restored."); 
-        trigger_rich_toast(title_id, title_name, "Restored"); 
+        // Silent on restore/remount to avoid spam
     }
     else { log_debug("  [REG] FAIL: 0x%x", res); return false; }
     return true;
@@ -302,11 +298,10 @@ bool mount_and_install(const char* src_path, const char* title_id, const char* t
 
 void scan_all_paths() {
     
-    // Simple Cache Cleaner
+    // Cache Cleaner
     for(int k=0; k<MAX_PENDING; k++) {
         if (cache[k].valid) {
             if (access(cache[k].path, F_OK) != 0) {
-                log_debug("  [CACHE] Path gone: %s", cache[k].path);
                 cache[k].valid = false;
             }
         }
@@ -314,8 +309,10 @@ void scan_all_paths() {
 
     for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
         DIR* d = opendir(SCAN_PATHS[i]); if (!d) continue; 
+        
         struct dirent* entry;
         while ((entry = readdir(d)) != NULL) { 
+
             if (entry->d_name[0] == '.') continue; 
             char full_path[MAX_PATH]; snprintf(full_path, sizeof(full_path), "%s/%s", SCAN_PATHS[i], entry->d_name); 
             
@@ -338,52 +335,75 @@ void scan_all_paths() {
                 }
             } else { continue; }
 
-            // Skip if already mounted
-            if (is_installed(title_id) && is_data_mounted(title_id)) {
-                log_debug("  [SKIP] %s (Ready)", title_name);
+            // 1. Skip if perfect
+            bool installed = is_installed(title_id);
+            if (installed && is_data_mounted(title_id)) {
                 continue; 
             }
 
-            notify_system("Found New Game: Installing %s...", title_name);
-            log_debug("  [ACTION] Installing: %s", title_name);
-            
-            if (!wait_for_stability(full_path, title_name)) continue;
-            mount_and_install(full_path, title_id, title_name);
+            // 2. Decide Action
+            bool is_remount = false;
+            if (installed) {
+                log_debug("  [ACTION] Remounting: %s", title_name);
+                // NOTIFICATION REMOVED FOR REMOUNT AS REQUESTED
+                is_remount = true;
+            } else {
+                log_debug("  [ACTION] Installing: %s", title_name);
+                notify_system("Installing: %s...", title_name); 
+                
+                // FAST CHECK
+                if (!wait_for_stability_fast(full_path, title_name)) continue;
+                is_remount = false;
+            }
+
+            mount_and_install(full_path, title_id, title_name, is_remount);
         }
         closedir(d);
     }
 }
 
 int main() {
+    // Initialize services
+    sceUserServiceInitialize(0);
     sceAppInstUtilInitialize();
-    remove(LOCK_FILE); 
-    remove(LOG_FILE); mkdir(LOG_DIR, 0777);
-    log_debug("SHADOWMOUNT v1.2 Beta (VOIDWHISPER EDITION) START");
-    
-    notify_system("ShadowMount v1.2 Beta by VoidWhisper Loaded");
+    kernel_set_ucred_authid(-1, 0x4801000000000013L);
 
+    remove(LOCK_FILE); 
+    remove(LOG_FILE); 
+    mkdir(LOG_DIR, 0777);
+    
+    log_debug("SHADOWMOUNT v1.3 START");
+    
+    // --- STARTUP LOGIC ---
     int new_games = count_new_candidates();
-    if (new_games > 0) {
-        notify_system("Found %d new games. Starting...", new_games);
+    
+    if (new_games == 0) {
+        // SCENARIO A: Nothing to do.
+        notify_system("ShadowMount v1.3: Library Ready.\n- VoidWhisper");
     } else {
-        notify_system("No new dumps found. Monitoring...");
+        // SCENARIO B: Work needed.
+        notify_system("ShadowMount v1.3: Found %d Games. Executing...", new_games);
+        
+        // Run the scan immediately to process them
+        scan_all_paths();
+        
+        // Completion Message
+        notify_system("Library Synchronized. - VoidWhisper");
     }
 
+    // --- DAEMON LOOP ---
     int lock = open(LOCK_FILE, O_CREAT | O_EXCL | O_RDWR, 0666);
-    if (lock < 0 && errno == EEXIST) { log_debug("FATAL: Daemon running."); return 0; }
+    if (lock < 0 && errno == EEXIST) { return 0; }
 
-    bool first_run = true;
     while (true) {
         if (access(KILL_FILE, F_OK) == 0) { remove(KILL_FILE); remove(LOCK_FILE); return 0; }
         
-        scan_all_paths();
-        
-        if (first_run && new_games > 0) {
-            notify_system("All dumps configured. Enjoy! - VoidWhisper");
-            first_run = false;
-        }
-
+        // Sleep FIRST since we either just finished scan above, or library was ready.
         sceKernelUsleep(SCAN_INTERVAL_US);
+        
+        scan_all_paths();
     }
+    
+    sceUserServiceTerminate();
     return 0;
 }
