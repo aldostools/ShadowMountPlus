@@ -1,0 +1,75 @@
+# ShadowMount (PS5)
+**v1.2 Beta by VoidWhisper**
+
+**ShadowMount** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMount automatically detects, mounts, and installs game dumps instantly upon USB connection.
+
+**Compatibility:** Supports all Jailbroken PS5 firmwares running **Kstuff v1.6.7**.
+
+---
+
+## 🚀 Key Features
+
+* **Zero-Touch Automation:** No menus, no clicks. Simply connect your USB drive, and games are detected and installed automatically.
+* **No Extra Apps Required:** Replaces the need for Itemzflow, webMAN, DumpRunner, DumpInstaller, WebSrv, or the Homebrew Store for mounting operations.
+* **Automated Asset Management:** Automatically handles `sce_sys` assets (icons, background music, wallpapers), eliminating the need to copy files manually.
+* **Hot-Swap Support:** Seamlessly handles unplugging and replugging drives without system instability.
+* **Batch Processing:** Capable of scanning and mounting dozens of games simultaneously in seconds.
+* **Smart Detection:** intelligently detects previously mounted games on boot and skips them to ensure zero-overhead startup.
+* **Visual Feedback:**
+    * **System Notifications:** Non-intrusive status updates for new installations.
+    * **Rich Toasts (Optional):** Graphical pop-ups confirming "Game Installed" (requires `notify.elf`).
+
+---
+
+## 📂 Supported Paths
+ShadowMount performs a recursive scan of **Internal Storage** and **All USB Ports** for the following directory structures:
+
+* `/data/homebrew`
+* `/data/etaHEN/games`
+* `/mnt/usb0/homebrew` through `/mnt/usb7/homebrew`
+* `/mnt/usb0/etaHEN/games` through `/mnt/usb7/etaHEN/games`
+* `/mnt/ext0/homebrew` & `/mnt/ext0/etaHEN/games`
+
+---
+
+## 🛠️ Installation & Usage
+
+**Prerequisites:**
+* Jailbroken PS5 Console.
+* **Kstuff v1.6.7** loaded via UMTX/Y2JB.
+* *Note: etaHEN and Itemzflow are OPTIONAL. ShadowMount works independently.*
+
+### Method 1: Manual Payload Injection (Port 9021)
+Use a payload sender (such as NetCat GUI or a web-based loader) to send the files to **Port 9021**.
+
+1.  Send `notify.elf` (Optional, required only for Rich Toasts).
+2.  Send `shadowmount.elf`.
+3.  Wait for the notification: *"ShadowMount v1.2 Beta by VoidWhisper Loaded"*.
+
+### Method 2: PLK Autoloader (Recommended)
+Add ShadowMount to your `autoload.txt` for **plk-autoloader** to ensure it starts automatically on every boot.
+*Important: Ensure `notify.elf` loads before `shadowmount.elf`.*
+
+**Sample Configuration:**
+```ini
+!1000
+kstuff.elf
+!1000
+notify.elf
+!1000
+shadowmount.elf
+```
+
+---
+
+## ⚠️ Notes
+* **First Run:** If you have a large library, the initial scan may take a few seconds to register all titles.
+* **Large Games:** For massive games (100GB+), allow a few extra seconds for the system to verify file integrity before the "Installed" notification appears.
+
+## Credits
+* **VoidWhisper** - Lead Developer & Logic Implementation
+* **Special Thanks:**
+    * EchoStretch
+    * LightningMods
+    * john-tornblom
+    * PS5 R&D Community
