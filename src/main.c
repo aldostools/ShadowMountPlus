@@ -484,7 +484,7 @@ static void scan_ufs_images() {
   }
 }
 
-// --- JSON & DRM ---
+// --- JSON  ---
 static int extract_json_string(const char *json, const char *key, char *out,
                                size_t out_size) {
   char search[64];
@@ -508,58 +508,10 @@ static int extract_json_string(const char *json, const char *key, char *out,
   out[i] = '\0';
   return 0;
 }
-static int fix_application_drm_type(const char *path) {
-  FILE *f = fopen(path, "rb+");
-  if (!f)
-    return -1;
-  fseek(f, 0, SEEK_END);
-  long len = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (len <= 0 || len > 1024 * 1024 * 5) {
-    fclose(f);
-    return -1;
-  }
-  char *buf = (char *)malloc(len + 1);
-  fread(buf, 1, len, f);
-  buf[len] = '\0';
-  const char *key = "\"applicationDrmType\"";
-  char *p = strstr(buf, key);
-  if (!p) {
-    free(buf);
-    fclose(f);
-    return 0;
-  }
-  char *colon = strchr(p + strlen(key), ':');
-  char *q1 = colon ? strchr(colon, '"') : NULL;
-  char *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
-  if (!q1 || !q2) {
-    free(buf);
-    fclose(f);
-    return -1;
-  }
-  if ((q2 - q1 - 1) == strlen("standard") &&
-      !strncmp(q1 + 1, "standard", strlen("standard"))) {
-    free(buf);
-    fclose(f);
-    return 0;
-  }
-  size_t new_len = (q1 - buf) + 1 + strlen("standard") + 1 + strlen(q2 + 1);
-  char *out = (char *)malloc(new_len + 1);
-  memcpy(out, buf, q1 - buf + 1);
-  memcpy(out + (q1 - buf + 1), "standard", strlen("standard"));
-  strcpy(out + (q1 - buf + 1 + strlen("standard")), q2);
-  fseek(f, 0, SEEK_SET);
-  fwrite(out, 1, strlen(out), f);
-  fclose(f);
-  free(buf);
-  free(out);
-  return 1;
-}
 
 bool get_game_info(const char *base_path, char *out_id, char *out_name) {
   char path[MAX_PATH];
   snprintf(path, sizeof(path), "%s/sce_sys/param.json", base_path);
-  fix_application_drm_type(path);
   FILE *f = fopen(path, "rb");
   if (f) {
     fseek(f, 0, SEEK_END);
