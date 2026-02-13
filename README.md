@@ -1,9 +1,28 @@
 # ShadowMount (PS5)
-**v1.3 Beta by VoidWhisper**
+**v1.4 by VoidWhisper (+exFAT ffpkg)**
+
+Thanks for supporting ffpkg @Gezine, @earthonion.
 
 **ShadowMount** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMount automatically detects, mounts, and installs game dumps from both **internal and external storage**.
 
 **Compatibility:** Supports all Jailbroken PS5 firmwares running **Kstuff v1.6.7**.
+
+## How to create an exFAT image
+
+**Ubuntu/Debian:**
+sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync
+truncate -s <image_size> test.ffpkg
+mkfs.exfat -n TESTFFPKG test.ffpkg
+mkdir /mnt/exfat
+mount -t exfat-fuse -o loop test.ffpkg /mnt/exfat
+rsync -r --info=progress2 APPXXXX/ /mnt/exfat/
+umount /mnt/exfat
+
+**Windows:**
+Use ImDisk Toolkit
+
+**Why is using USF2 images a bad option?**
+Because UFS2 is a case-sensitive file system, and PKG is not, games and programs rely on using a case-insensitive file system, and because of this, many do not work on a built-in drive with a case-sensitive file system (BFS).
 
 ---
 
