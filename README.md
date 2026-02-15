@@ -58,7 +58,19 @@ Linux (Ubuntu/Debian):
 - `umount /mnt/exfat`
 
 Windows:
-- Use ImDisk Toolkit (or an equivalent loop-mount utility).
+- Recommended: use `make_image.bat` (wrapper for `New-OsfExfatImage.ps1` + OSFMount).
+- Requirements:
+  - Install OSFMount: https://www.osforensics.com/tools/mount-disk-images.html (must provide `osfmount.com`).
+  - Keep `make_image.bat` and `New-OsfExfatImage.ps1` in the same folder.
+  - Run `cmd.exe` as Administrator.
+- Usage:
+  - `make_image.bat "C:\images\game.exfat" "C:\payload\APPXXXX"`
+- Behavior:
+  - Auto-sizes the image to fit source content.
+  - Formats and copies the source folder into the image.
+  - Overwrites existing image file (uses `-ForceOverwrite`).
+- Optional (fixed size): run PowerShell script directly:
+  - `powershell.exe -ExecutionPolicy Bypass -File .\New-OsfExfatImage.ps1 -ImagePath "C:\images\game.exfat" -SourceDir "C:\payload\APPXXXX" -Size 8G -ForceOverwrite`
 
 ## Why UFS can be problematic
 

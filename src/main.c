@@ -30,6 +30,8 @@
 #define MAX_PENDING 512
 #define MAX_UFS_MOUNTS 64
 #define MAX_NULLFS_MOUNTS MAX_PENDING
+#define MAX_FAILED_MOUNT_ATTEMPTS 3
+#define MAX_MISSING_PARAM_SCAN_ATTEMPTS 3
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
@@ -42,7 +44,7 @@
 #define IOVEC_ENTRY(x) {(void *)(x), (x) ? strlen(x) + 1 : 0}
 #define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 // 1 = use legacy /dev/mdctl backend for .exfat images, 0 = use LVD for all.
-#define EXFAT_ATTACH_USE_MDCTL 1
+#define EXFAT_ATTACH_USE_MDCTL 0
 
 // --- LVD Definitions ---
 // Observed parameter variants in refs/libSceFsInternalForVsh.sprx.c:
@@ -62,12 +64,12 @@
 #define LVD_ATTACH_OPTION_FLAGS_RW 0x9
 #define LVD_ATTACH_OPTION_NORM_DD_RO 0x16
 #define LVD_ATTACH_OPTION_NORM_DD_RW 0x1E
-#define LVD_SECTOR_SIZE_DEFAULT 512u
-#define LVD_SECTOR_SIZE_MAX 4096u
+#define LVD_SECTOR_SIZE_EXFAT 512u
+#define LVD_SECTOR_SIZE_UFS_PFS 4096u
+
 // Raw option bits are normalized by sceFsLvdAttachCommon before validation:
 // raw:0x1->norm:0x08, raw:0x2->norm:0x80, raw:0x4->norm:0x02, raw:0x8->norm:0x10.
 // The normalized masks are then checked against validator constraints (0x82/0x92).
-// Reference notes: docs/fs_mounting_re_notes.md ("Raw option bits -> validator bits").
 #define LVD_ATTACH_IMAGE_TYPE 0
 #define LVD_ATTACH_IMAGE_TYPE_UFS_DOWNLOAD_DATA 7
 #define LVD_ATTACH_LAYER_COUNT 1
@@ -286,6 +288,16 @@ struct GameCache {
 };
 struct GameCache cache[MAX_PENDING];
 
+struct AttemptCache {
+  char path[MAX_PATH];
+  char title_id[MAX_TITLE_ID];
+  uint8_t mount_reg_attempts;
+  uint8_t config_attempts;
+  bool config_limit_logged;
+  bool valid;
+};
+struct AttemptCache attempt_cache[MAX_PENDING];
+
 typedef enum {
   ATTACH_BACKEND_NONE = 0,
   // /dev/lvdctl -> /dev/lvdN
@@ -344,6 +356,132 @@ static void cache_game_entry(const char *path, const char *title_id,
       return;
     }
   }
+}
+
+static bool is_under_ufs_mount_base(const char *path) {
+  if (!path)
+    return false;
+  size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
+  return (strncmp(path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
+          (path[ufs_prefix_len] == '/' || path[ufs_prefix_len] == '\0'));
+}
+
+static struct AttemptCache *find_attempt_entry(const char *path) {
+  for (int k = 0; k < MAX_PENDING; k++) {
+    if (!attempt_cache[k].valid)
+      continue;
+    if (strcmp(attempt_cache[k].path, path) == 0)
+      return &attempt_cache[k];
+  }
+  return NULL;
+}
+
+static struct AttemptCache *get_or_create_attempt_entry(const char *path) {
+  struct AttemptCache *entry = find_attempt_entry(path);
+  if (entry)
+    return entry;
+
+  for (int k = 0; k < MAX_PENDING; k++) {
+    if (attempt_cache[k].valid)
+      continue;
+    copy_cstr(attempt_cache[k].path, sizeof(attempt_cache[k].path), path);
+    attempt_cache[k].title_id[0] = '\0';
+    attempt_cache[k].mount_reg_attempts = 0;
+    attempt_cache[k].config_attempts = 0;
+    attempt_cache[k].config_limit_logged = false;
+    attempt_cache[k].valid = true;
+    return &attempt_cache[k];
+  }
+  return NULL;
+}
+
+static void update_attempt_title_id(struct AttemptCache *entry,
+                                    const char *title_id) {
+  if (!entry || !title_id || title_id[0] == '\0')
+    return;
+  copy_cstr(entry->title_id, sizeof(entry->title_id), title_id);
+}
+
+static void prune_attempt_cache(void) {
+  for (int k = 0; k < MAX_PENDING; k++) {
+    if (!attempt_cache[k].valid)
+      continue;
+    if (access(attempt_cache[k].path, F_OK) == 0)
+      continue;
+    attempt_cache[k].valid = false;
+    attempt_cache[k].mount_reg_attempts = 0;
+    attempt_cache[k].config_attempts = 0;
+    attempt_cache[k].config_limit_logged = false;
+    attempt_cache[k].path[0] = '\0';
+    attempt_cache[k].title_id[0] = '\0';
+  }
+}
+
+static bool is_missing_param_scan_limited(const char *path) {
+  if (!is_under_ufs_mount_base(path))
+    return false;
+  struct AttemptCache *entry = find_attempt_entry(path);
+  if (!entry)
+    return false;
+  return entry->config_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS;
+}
+
+static void record_missing_param_failure(const char *path) {
+  if (!is_under_ufs_mount_base(path))
+    return;
+
+  struct AttemptCache *entry = get_or_create_attempt_entry(path);
+  if (!entry) {
+    log_debug("  [SCAN] missing/invalid param.json: %s", path);
+    return;
+  }
+
+  if (entry->config_attempts < UINT8_MAX)
+    entry->config_attempts++;
+
+  log_debug("  [SCAN] missing/invalid param.json: %s", path);
+
+  if (entry->config_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS &&
+      !entry->config_limit_logged) {
+    log_debug("  [SCAN] attempt limit reached (%u), skipping path: %s",
+              (unsigned)MAX_MISSING_PARAM_SCAN_ATTEMPTS, path);
+    entry->config_limit_logged = true;
+  }
+}
+
+static void clear_missing_param_entry(const char *path) {
+  struct AttemptCache *entry = find_attempt_entry(path);
+  if (!entry)
+    return;
+  entry->config_attempts = 0;
+  entry->config_limit_logged = false;
+}
+
+static uint8_t get_failed_mount_attempts(const char *path, const char *title_id) {
+  struct AttemptCache *entry = find_attempt_entry(path);
+  if (!entry)
+    return 0;
+  update_attempt_title_id(entry, title_id);
+  return entry->mount_reg_attempts;
+}
+
+static void clear_failed_mount_attempts(const char *path, const char *title_id) {
+  struct AttemptCache *entry = find_attempt_entry(path);
+  if (!entry)
+    return;
+  update_attempt_title_id(entry, title_id);
+  entry->mount_reg_attempts = 0;
+}
+
+static uint8_t bump_failed_mount_attempts(const char *path,
+                                          const char *title_id) {
+  struct AttemptCache *entry = get_or_create_attempt_entry(path);
+  if (!entry)
+    return MAX_FAILED_MOUNT_ATTEMPTS;
+  update_attempt_title_id(entry, title_id);
+  if (entry->mount_reg_attempts < UINT8_MAX)
+    entry->mount_reg_attempts++;
+  return entry->mount_reg_attempts;
 }
 
 static void cache_ufs_mount(const char *path, int unit_id,
@@ -753,17 +891,15 @@ static bool wait_for_md_node_state(int unit_id, bool should_exist) {
   return wait_for_dev_node_state(devname, should_exist);
 }
 
-static uint32_t get_lvd_sector_size(const char *path) {
-  struct statfs sfs;
-  if (path && statfs(path, &sfs) == 0) {
-    uint64_t sector = (uint64_t)sfs.f_bsize;
-    if (sector == 0) 
-      return LVD_SECTOR_SIZE_DEFAULT;
-    if (sector > LVD_SECTOR_SIZE_MAX) 
-      sector = LVD_SECTOR_SIZE_MAX;
-    return (uint32_t)sector;
+static uint32_t get_lvd_sector_size(image_fs_type_t fs_type) {
+  switch (fs_type) {
+  case IMAGE_FS_UFS:
+  case IMAGE_FS_PFS:
+    return LVD_SECTOR_SIZE_UFS_PFS;
+  case IMAGE_FS_EXFAT:
+  default:
+    return LVD_SECTOR_SIZE_EXFAT;
   }
-  return LVD_SECTOR_SIZE_DEFAULT;
 }
 
 static uint16_t lvd_option_len_from_flags(uint16_t options) {
@@ -1173,7 +1309,7 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
     req.layer_count = LVD_ATTACH_LAYER_COUNT;
     req.device_size = (uint64_t)st.st_size;
     req.layers_ptr = layers;
-    req.sector_size_0 = get_lvd_sector_size(file_path);
+    req.sector_size_0 = get_lvd_sector_size(fs_type);
     req.sector_size_1 = req.sector_size_0;
 
     int last_errno = 0;
@@ -1274,6 +1410,8 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
              build_iovec(&iov, &iovlen, "timezone", "static", (size_t)-1) &&
              build_iovec(&iov, &iovlen, "async", NULL, (size_t)-1) &&
              build_iovec(&iov, &iovlen, "ignoreacl", NULL, (size_t)-1);
+             build_iovec(&iov, &iovlen, "errmsg", mount_errmsg,
+                         sizeof(mount_errmsg));
   } else if (fs_type == IMAGE_FS_PFS) {
     const char *sigverify = pfs_profile->sigverify ? "1" : "0";
     const char *playgo = pfs_profile->playgo ? "1" : "0";
@@ -1386,6 +1524,7 @@ static void scan_ufs_images() {
       ufs_cache[k].valid = false;
     }
   }
+  prune_attempt_cache();
 
   for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
     if (should_stop_requested())
@@ -1565,17 +1704,16 @@ int count_new_candidates() {
           !is_active_image_mount_point(full_path)) {
         continue;
       }
+      if (is_missing_param_scan_limited(full_path))
+        continue;
 
       char title_id[MAX_TITLE_ID];
       char title_name[MAX_TITLE_NAME];
       if (!get_game_info(full_path, title_id, title_name)) {
-        size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
-        if (strncmp(full_path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
-            (full_path[ufs_prefix_len] == '/' || full_path[ufs_prefix_len] == '\0')) {
-          log_debug("  [SCAN] missing/invalid param.json: %s", full_path);
-        }
+        record_missing_param_failure(full_path);
         continue;
       }
+      clear_missing_param_entry(full_path);
       bool installed = is_installed(title_id);
       bool mounted = is_data_mounted(title_id);
       if (installed && mounted) {
@@ -1584,6 +1722,10 @@ int count_new_candidates() {
             strcmp(tracked_path, full_path) == 0) {
           continue;
         }
+      }
+      if (get_failed_mount_attempts(full_path, title_id) >=
+          MAX_FAILED_MOUNT_ATTEMPTS) {
+        continue;
       }
 
       bool already_seen = false;
@@ -1732,6 +1874,8 @@ void scan_all_paths() {
           !is_active_image_mount_point(full_path)) {
         continue;
       }
+      if (is_missing_param_scan_limited(full_path))
+        continue;
 
       bool already_seen = false;
       for (int k = 0; k < MAX_PENDING; k++) {
@@ -1746,13 +1890,10 @@ void scan_all_paths() {
       char title_id[MAX_TITLE_ID];
       char title_name[MAX_TITLE_NAME];
       if (!get_game_info(full_path, title_id, title_name)) {
-        size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
-        if (strncmp(full_path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
-            (full_path[ufs_prefix_len] == '/' || full_path[ufs_prefix_len] == '\0')) {
-          log_debug("  [SCAN] missing/invalid param.json: %s", full_path);
-        }
+        record_missing_param_failure(full_path);
         continue;
       }
+      clear_missing_param_entry(full_path);
 
       // 1. Skip if perfect
       bool installed = is_installed(title_id);
@@ -1763,6 +1904,10 @@ void scan_all_paths() {
             strcmp(tracked_path, full_path) == 0) {
           continue;
         }
+      }
+      if (get_failed_mount_attempts(full_path, title_id) >=
+          MAX_FAILED_MOUNT_ATTEMPTS) {
+        continue;
       }
 
       // 2. Decide Action
@@ -1782,7 +1927,15 @@ void scan_all_paths() {
       }
 
       if (mount_and_install(full_path, title_id, title_name, is_remount)) {
+        clear_failed_mount_attempts(full_path, title_id);
         cache_game_entry(full_path, title_id, title_name);
+      } else {
+        uint8_t attempts = bump_failed_mount_attempts(full_path, title_id);
+        if (attempts == MAX_FAILED_MOUNT_ATTEMPTS) {
+          log_debug("  [RETRY] limit reached (%u/%u): %s (%s)",
+                    (unsigned)attempts,
+                    (unsigned)MAX_FAILED_MOUNT_ATTEMPTS, title_name, title_id);
+        }
       }
     }
     closedir(d);
