@@ -24,19 +24,30 @@
 #include <unistd.h>
 
 #include <ps5/kernel.h>
+#include <sqlite3.h>
 
 // --- Configuration ---
-#define SCAN_INTERVAL_US 3000000
+#define SCAN_INTERVAL_US 10000000
 #define MAX_PENDING 512
 #define MAX_UFS_MOUNTS 64
 #define MAX_NULLFS_MOUNTS MAX_PENDING
+#define PATH_STATE_CAPACITY MAX_PENDING
+#define TITLE_STATE_CAPACITY MAX_PENDING
+#define STATE_HASH_SIZE 1024u
+#define MAX_SCAN_PATHS 128
 #define MAX_FAILED_MOUNT_ATTEMPTS 1
 #define MAX_MISSING_PARAM_SCAN_ATTEMPTS 3
 #define MAX_IMAGE_MOUNT_ATTEMPTS 3
 #define IMAGE_MOUNT_READ_ONLY 1
+#define APP_DB_QUERY_BUSY_RETRIES 3
+#define APP_DB_UPDATE_BUSY_RETRIES 25
+#define APP_DB_PREPARE_BUSY_RETRIES 25
+#define APP_DB_BUSY_RETRY_SLEEP_US 200000u
+#define APP_DB_BUSY_TIMEOUT_MS 5000
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
+#define SHADOWMOUNT_VERSION "1.5beta2"
 #define UFS_MOUNT_BASE "/data/ufsmnt"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
@@ -44,6 +55,7 @@
 #define LOCK_FILE "/data/shadowmount/daemon.lock"
 #define KILL_FILE "/data/shadowmount/STOP"
 #define TOAST_FILE "/data/shadowmount/notify.txt"
+#define APP_DB_PATH "/system_data/priv/mms/app.db"
 #define IOVEC_ENTRY(x)                                                        \
   {(void *)(x),                                                               \
    ((const char *)(x) == NULL ? 0u : (size_t)(strlen((const char *)(x)) + 1u))}
@@ -88,7 +100,9 @@
 #define LVD_ENTRY_FLAG_NO_BITMAP 0x1
 #define LVD_NODE_WAIT_US 100000
 #define LVD_NODE_WAIT_RETRIES 100
-#define UFS_NMOUNT_FLAG_BASE 0x10000000u
+#define UFS_NMOUNT_FLAG_RW 0x10000000u
+#define UFS_NMOUNT_FLAG_RO 0x10000001u
+
 
 // --- devpfs/pfs option defaults ---
 // PFS nmount key/value variants observed in refs:
@@ -109,7 +123,7 @@
 #define PFS_MOUNT_PLAYGO 0
 #define PFS_MOUNT_DISC 0
 
-// 4x64-bit PFS key encoded as 64 hex chars (same effective zero key as makepfs.c).
+// 4x64-bit PFS key encoded as 64 hex chars.
 #define PFS_ZERO_EKPFS_KEY_HEX \
   "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -137,16 +151,6 @@ typedef struct {
   devpfs_mount_opt_t opt;
 } devpfs_mount_profile_t;
 
-_Static_assert(offsetof(devpfs_mount_opt_t, ro) == 0x00,
-               "devpfs_mount_opt_t.ro offset");
-_Static_assert(offsetof(devpfs_mount_opt_t, budget_id) == 0x08,
-               "devpfs_mount_opt_t.budget_id offset");
-_Static_assert(offsetof(devpfs_mount_opt_t, flags) == 0x14,
-               "devpfs_mount_opt_t.flags offset");
-_Static_assert(offsetof(devpfs_mount_opt_t, max_pkg_gib) == 0x18,
-               "devpfs_mount_opt_t.max_pkg_gib offset");
-_Static_assert(sizeof(devpfs_mount_opt_t) == 0x20,
-               "devpfs_mount_opt_t size");
 
 typedef struct {
   // Source object class (observed: 1=file, 2=device-like source).
@@ -201,9 +205,7 @@ typedef struct {
   uint8_t reserved[0x20];
 } lvd_ioctl_detach_t;
 
-_Static_assert(sizeof(lvd_kernel_layer_t) == 0x38, "lvd_kernel_layer_t size");
-_Static_assert(sizeof(lvd_ioctl_attach_t) == 0x28, "lvd_ioctl_attach_t size");
-_Static_assert(sizeof(lvd_ioctl_detach_t) == 0x28, "lvd_ioctl_detach_t size");
+
 
 // --- SDK Imports ---
 int sceAppInstUtilInitialize(void);
@@ -214,7 +216,8 @@ int sceUserServiceInitialize(void *);
 void sceUserServiceTerminate(void);
 
 // --- Forward Declarations ---
-bool get_game_info(const char *base_path, char *out_id, char *out_name);
+bool get_game_info(const char *base_path, const struct stat *param_st,
+                   char *out_id, char *out_name);
 bool is_installed(const char *title_id);
 bool is_data_mounted(const char *title_id);
 void notify_system(const char *fmt, ...);
@@ -227,16 +230,17 @@ typedef struct notify_request {
 } notify_request_t;
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
+// --- Runtime Scan Sources and State Caches ---
 // Scan Paths
-const char *SCAN_PATHS[] = {
+static const char *DEFAULT_SCAN_PATHS[] = {
     // Internal
     "/data/homebrew", "/data/etaHEN/games",
 
     // Extended Storage
-    "/mnt/ext0/etaHEN/homebrew", "/mnt/ext0/etaHEN/games",
+    "/mnt/ext0/homebrew",  "/mnt/ext0/etaHEN/games",
 
     // M.2 Drive
-    "/mnt/ext1/etaHEN/homebrew", "/mnt/ext1/etaHEN/games",
+    "/mnt/ext1/homebrew",  "/mnt/ext1/etaHEN/games",
 
     // USB Subfolders
     "/mnt/usb0/homebrew", "/mnt/usb1/homebrew", "/mnt/usb2/homebrew",
@@ -252,10 +256,10 @@ const char *SCAN_PATHS[] = {
     "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
     "/mnt/usb5", "/mnt/usb6", "/mnt/usb7", "/mnt/ext0", "/mnt/ext1",
 
-    // UFS Mounted Images
-    UFS_MOUNT_BASE,
-
     NULL};
+static const char *SCAN_PATHS[MAX_SCAN_PATHS + 1];
+static char g_scan_path_storage[MAX_SCAN_PATHS][MAX_PATH];
+static int g_scan_path_count = 0;
 
 struct GameCache {
   char path[MAX_PATH];
@@ -265,17 +269,46 @@ struct GameCache {
 };
 struct GameCache cache[MAX_PENDING];
 
-struct AttemptCache {
+struct PathStateEntry {
   char path[MAX_PATH];
-  char title_id[MAX_TITLE_ID];
-  uint8_t mount_reg_attempts;
-  uint8_t config_attempts;
+  uint8_t missing_param_attempts;
   uint8_t image_mount_attempts;
-  bool config_limit_logged;
+  bool missing_param_limit_logged;
   bool image_mount_limit_logged;
+  bool game_info_cached;
+  bool game_info_valid;
+  time_t game_info_mtime;
+  off_t game_info_size;
+  ino_t game_info_ino;
+  char game_title_id[MAX_TITLE_ID];
+  char game_title_name[MAX_TITLE_NAME];
   bool valid;
 };
-struct AttemptCache attempt_cache[MAX_PENDING];
+struct PathStateEntry g_path_state[PATH_STATE_CAPACITY];
+static uint16_t g_path_state_hash[STATE_HASH_SIZE];
+
+struct TitleStateEntry {
+  char title_id[MAX_TITLE_ID];
+  uint8_t mount_reg_attempts;
+  bool register_attempted_once;
+  bool valid;
+};
+struct TitleStateEntry g_title_state[TITLE_STATE_CAPACITY];
+static uint16_t g_title_state_hash[STATE_HASH_SIZE];
+
+struct AppDbLookupCache {
+  char title_id[MAX_TITLE_ID];
+  bool in_app_db;
+  bool valid;
+};
+
+typedef struct {
+  char path[MAX_PATH];
+  char title_id[MAX_TITLE_ID];
+  char title_name[MAX_TITLE_NAME];
+  bool installed;
+  bool in_app_db;
+} scan_candidate_t;
 
 typedef enum {
   ATTACH_BACKEND_NONE = 0,
@@ -298,6 +331,7 @@ typedef enum {
 #endif
 
 typedef struct {
+  bool debug_enabled;
   bool mount_read_only;
   attach_backend_t exfat_backend;
   attach_backend_t ufs_backend;
@@ -310,6 +344,12 @@ typedef struct {
 
 static runtime_config_t g_runtime_cfg;
 static bool g_runtime_cfg_ready = false;
+static sqlite3 *g_app_db = NULL;
+static sqlite3_stmt *g_app_db_stmt_has_title = NULL;
+static sqlite3_stmt *g_app_db_stmt_update_snd0 = NULL;
+static scan_candidate_t g_scan_candidates[MAX_PENDING];
+static struct AppDbLookupCache g_scan_db_lookup_cache[MAX_PENDING];
+static char g_scan_discovered_param_roots[MAX_PENDING][MAX_PATH];
 
 struct UfsCache {
   // Absolute source image path.
@@ -342,21 +382,65 @@ typedef enum {
 
 static const char *backend_name(attach_backend_t backend);
 
-static void copy_cstr(char *dst, size_t dst_size, const char *src) {
-  if (dst_size == 0)
-    return;
-  if (!src)
-    src = "";
-  snprintf(dst, dst_size, "%s", src);
+// --- Core Utilities ---
+static void clear_runtime_scan_paths(void) {
+  g_scan_path_count = 0;
+  memset(SCAN_PATHS, 0, sizeof(SCAN_PATHS));
+  memset(g_scan_path_storage, 0, sizeof(g_scan_path_storage));
+}
+
+static bool add_runtime_scan_path(const char *path) {
+  if (!path)
+    return false;
+
+  while (*path && isspace((unsigned char)*path))
+    path++;
+
+  size_t len = strlen(path);
+  while (len > 0 && isspace((unsigned char)path[len - 1]))
+    len--;
+  if (len == 0 || len >= MAX_PATH)
+    return false;
+
+  char normalized[MAX_PATH];
+  memcpy(normalized, path, len);
+  normalized[len] = '\0';
+  while (len > 1 && normalized[len - 1] == '/') {
+    normalized[len - 1] = '\0';
+    len--;
+  }
+
+  for (int i = 0; i < g_scan_path_count; i++) {
+    if (SCAN_PATHS[i] && strcmp(SCAN_PATHS[i], normalized) == 0)
+      return true;
+  }
+
+  if (g_scan_path_count >= MAX_SCAN_PATHS)
+    return false;
+
+  (void)strlcpy(g_scan_path_storage[g_scan_path_count], normalized,
+                sizeof(g_scan_path_storage[g_scan_path_count]));
+  SCAN_PATHS[g_scan_path_count] = g_scan_path_storage[g_scan_path_count];
+  g_scan_path_count++;
+  SCAN_PATHS[g_scan_path_count] = NULL;
+  return true;
+}
+
+static void init_runtime_scan_paths_defaults(void) {
+  clear_runtime_scan_paths();
+  for (int i = 0; DEFAULT_SCAN_PATHS[i] != NULL; i++)
+    (void)add_runtime_scan_path(DEFAULT_SCAN_PATHS[i]);
+  // UFS mount root must always be present.
+  (void)add_runtime_scan_path(UFS_MOUNT_BASE);
 }
 
 static void cache_game_entry(const char *path, const char *title_id,
                              const char *title_name) {
   for (int k = 0; k < MAX_PENDING; k++) {
     if (!cache[k].valid) {
-      copy_cstr(cache[k].path, sizeof(cache[k].path), path);
-      copy_cstr(cache[k].title_id, sizeof(cache[k].title_id), title_id);
-      copy_cstr(cache[k].title_name, sizeof(cache[k].title_name), title_name);
+      (void)strlcpy(cache[k].path, path, sizeof(cache[k].path));
+      (void)strlcpy(cache[k].title_id, title_id, sizeof(cache[k].title_id));
+      (void)strlcpy(cache[k].title_name, title_name, sizeof(cache[k].title_name));
       cache[k].valid = true;
       return;
     }
@@ -368,140 +452,301 @@ static bool is_under_ufs_mount_base(const char *path) {
     return false;
   size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
   return (strncmp(path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
-          (path[ufs_prefix_len] == '/' || path[ufs_prefix_len] == '\0'));
+          path[ufs_prefix_len] == '/');
 }
 
-static struct AttemptCache *find_attempt_entry(const char *path) {
-  for (int k = 0; k < MAX_PENDING; k++) {
-    if (!attempt_cache[k].valid)
+// --- Fast Path/Title State Cache (hash indexed) ---
+static uint32_t hash_string(const char *s) {
+  uint32_t h = 2166136261u;
+  while (s && *s) {
+    h ^= (uint8_t)(*s++);
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static void rebuild_path_state_hash(void) {
+  memset(g_path_state_hash, 0, sizeof(g_path_state_hash));
+  for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+    if (!g_path_state[k].valid || g_path_state[k].path[0] == '\0')
       continue;
-    if (strcmp(attempt_cache[k].path, path) == 0)
-      return &attempt_cache[k];
+    uint32_t slot = hash_string(g_path_state[k].path) & (STATE_HASH_SIZE - 1u);
+    for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+      if (g_path_state_hash[slot] == 0) {
+        g_path_state_hash[slot] = (uint16_t)(k + 1);
+        break;
+      }
+      slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
+    }
+  }
+}
+
+static void rebuild_title_state_hash(void) {
+  memset(g_title_state_hash, 0, sizeof(g_title_state_hash));
+  for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
+    if (!g_title_state[k].valid || g_title_state[k].title_id[0] == '\0')
+      continue;
+    uint32_t slot = hash_string(g_title_state[k].title_id) & (STATE_HASH_SIZE - 1u);
+    for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+      if (g_title_state_hash[slot] == 0) {
+        g_title_state_hash[slot] = (uint16_t)(k + 1);
+        break;
+      }
+      slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
+    }
+  }
+}
+
+static struct PathStateEntry *find_path_state(const char *path) {
+  if (!path || path[0] == '\0')
+    return NULL;
+  uint32_t slot = hash_string(path) & (STATE_HASH_SIZE - 1u);
+  for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+    uint16_t idx = g_path_state_hash[slot];
+    if (idx == 0)
+      return NULL;
+    struct PathStateEntry *entry = &g_path_state[idx - 1u];
+    if (entry->valid && strcmp(entry->path, path) == 0)
+      return entry;
+    slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
   }
   return NULL;
 }
 
-static struct AttemptCache *get_or_create_attempt_entry(const char *path) {
-  struct AttemptCache *entry = find_attempt_entry(path);
+static struct TitleStateEntry *find_title_state(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return NULL;
+  uint32_t slot = hash_string(title_id) & (STATE_HASH_SIZE - 1u);
+  for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+    uint16_t idx = g_title_state_hash[slot];
+    if (idx == 0)
+      return NULL;
+    struct TitleStateEntry *entry = &g_title_state[idx - 1u];
+    if (entry->valid && strcmp(entry->title_id, title_id) == 0)
+      return entry;
+    slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
+  }
+  return NULL;
+}
+
+static struct PathStateEntry *create_path_state(const char *path) {
+  if (!path || path[0] == '\0')
+    return NULL;
+
+  int slot_k = -1;
+  for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+    if (!g_path_state[k].valid) {
+      slot_k = k;
+      break;
+    }
+  }
+  if (slot_k < 0) {
+    int evict_k = -1;
+    for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+      if (!g_path_state[k].valid)
+        continue;
+      if (access(g_path_state[k].path, F_OK) != 0) {
+        evict_k = k;
+        break;
+      }
+    }
+    if (evict_k < 0) {
+      for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+        if (!g_path_state[k].valid)
+          continue;
+        if (g_path_state[k].missing_param_attempts == 0 &&
+            g_path_state[k].image_mount_attempts == 0 &&
+            !g_path_state[k].game_info_cached) {
+          evict_k = k;
+          break;
+        }
+      }
+    }
+    if (evict_k < 0)
+      evict_k = 0;
+    memset(&g_path_state[evict_k], 0, sizeof(g_path_state[evict_k]));
+    rebuild_path_state_hash();
+    slot_k = evict_k;
+  }
+
+  memset(&g_path_state[slot_k], 0, sizeof(g_path_state[slot_k]));
+  g_path_state[slot_k].valid = true;
+  (void)strlcpy(g_path_state[slot_k].path, path, sizeof(g_path_state[slot_k].path));
+
+  uint32_t slot = hash_string(path) & (STATE_HASH_SIZE - 1u);
+  for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+    if (g_path_state_hash[slot] == 0) {
+      g_path_state_hash[slot] = (uint16_t)(slot_k + 1);
+      return &g_path_state[slot_k];
+    }
+    slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
+  }
+
+  g_path_state[slot_k].valid = false;
+  g_path_state[slot_k].path[0] = '\0';
+  rebuild_path_state_hash();
+  return NULL;
+}
+
+static struct TitleStateEntry *create_title_state(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return NULL;
+
+  int slot_k = -1;
+  for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
+    if (!g_title_state[k].valid) {
+      slot_k = k;
+      break;
+    }
+  }
+  if (slot_k < 0) {
+    int evict_k = -1;
+    for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
+      if (!g_title_state[k].valid)
+        continue;
+      if (g_title_state[k].mount_reg_attempts == 0 &&
+          !g_title_state[k].register_attempted_once) {
+        evict_k = k;
+        break;
+      }
+    }
+    if (evict_k < 0) {
+      for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
+        if (!g_title_state[k].valid)
+          continue;
+        if (g_title_state[k].mount_reg_attempts == 0) {
+          evict_k = k;
+          break;
+        }
+      }
+    }
+    if (evict_k < 0)
+      evict_k = 0;
+    memset(&g_title_state[evict_k], 0, sizeof(g_title_state[evict_k]));
+    rebuild_title_state_hash();
+    slot_k = evict_k;
+  }
+
+  memset(&g_title_state[slot_k], 0, sizeof(g_title_state[slot_k]));
+  g_title_state[slot_k].valid = true;
+  (void)strlcpy(g_title_state[slot_k].title_id, title_id,
+                sizeof(g_title_state[slot_k].title_id));
+
+  uint32_t slot = hash_string(title_id) & (STATE_HASH_SIZE - 1u);
+  for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
+    if (g_title_state_hash[slot] == 0) {
+      g_title_state_hash[slot] = (uint16_t)(slot_k + 1);
+      return &g_title_state[slot_k];
+    }
+    slot = (slot + 1u) & (STATE_HASH_SIZE - 1u);
+  }
+
+  g_title_state[slot_k].valid = false;
+  g_title_state[slot_k].title_id[0] = '\0';
+  rebuild_title_state_hash();
+  return NULL;
+}
+
+static struct PathStateEntry *get_or_create_path_state(const char *path) {
+  struct PathStateEntry *entry = find_path_state(path);
+  return entry ? entry : create_path_state(path);
+}
+
+static struct TitleStateEntry *get_or_create_title_state(const char *title_id) {
+  struct TitleStateEntry *entry = find_title_state(title_id);
+  return entry ? entry : create_title_state(title_id);
+}
+
+static void prune_path_state(void) {
+  bool changed = false;
+  for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
+    if (!g_path_state[k].valid || g_path_state[k].path[0] == '\0')
+      continue;
+    if (access(g_path_state[k].path, F_OK) == 0)
+      continue;
+    memset(&g_path_state[k], 0, sizeof(g_path_state[k]));
+    changed = true;
+  }
+  if (changed)
+    rebuild_path_state_hash();
+}
+
+static bool was_register_attempted(const char *title_id) {
+  struct TitleStateEntry *entry = find_title_state(title_id);
+  return entry ? entry->register_attempted_once : false;
+}
+
+static void mark_register_attempted(const char *title_id) {
+  struct TitleStateEntry *entry = get_or_create_title_state(title_id);
   if (entry)
-    return entry;
-
-  for (int k = 0; k < MAX_PENDING; k++) {
-    if (attempt_cache[k].valid)
-      continue;
-    copy_cstr(attempt_cache[k].path, sizeof(attempt_cache[k].path), path);
-    attempt_cache[k].title_id[0] = '\0';
-    attempt_cache[k].mount_reg_attempts = 0;
-    attempt_cache[k].config_attempts = 0;
-    attempt_cache[k].image_mount_attempts = 0;
-    attempt_cache[k].config_limit_logged = false;
-    attempt_cache[k].image_mount_limit_logged = false;
-    attempt_cache[k].valid = true;
-    return &attempt_cache[k];
-  }
-  return NULL;
-}
-
-static void update_attempt_title_id(struct AttemptCache *entry,
-                                    const char *title_id) {
-  if (!entry || !title_id || title_id[0] == '\0')
-    return;
-  copy_cstr(entry->title_id, sizeof(entry->title_id), title_id);
-}
-
-static void prune_attempt_cache(void) {
-  for (int k = 0; k < MAX_PENDING; k++) {
-    if (!attempt_cache[k].valid)
-      continue;
-    if (access(attempt_cache[k].path, F_OK) == 0)
-      continue;
-    attempt_cache[k].valid = false;
-    attempt_cache[k].mount_reg_attempts = 0;
-    attempt_cache[k].config_attempts = 0;
-    attempt_cache[k].image_mount_attempts = 0;
-    attempt_cache[k].config_limit_logged = false;
-    attempt_cache[k].image_mount_limit_logged = false;
-    attempt_cache[k].path[0] = '\0';
-    attempt_cache[k].title_id[0] = '\0';
-  }
+    entry->register_attempted_once = true;
 }
 
 static bool is_missing_param_scan_limited(const char *path) {
   if (!is_under_ufs_mount_base(path))
     return false;
-  struct AttemptCache *entry = find_attempt_entry(path);
+  struct PathStateEntry *entry = find_path_state(path);
   if (!entry)
     return false;
-  return entry->config_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS;
+  return entry->missing_param_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS;
 }
 
 static void record_missing_param_failure(const char *path) {
   if (!is_under_ufs_mount_base(path))
     return;
 
-  struct AttemptCache *entry = get_or_create_attempt_entry(path);
+  struct PathStateEntry *entry = get_or_create_path_state(path);
   if (!entry) {
     log_debug("  [SCAN] missing/invalid param.json: %s", path);
     return;
   }
-
-  if (entry->config_attempts < UINT8_MAX)
-    entry->config_attempts++;
+  if (entry->missing_param_attempts < UINT8_MAX)
+    entry->missing_param_attempts++;
 
   log_debug("  [SCAN] missing/invalid param.json: %s", path);
-
-  if (entry->config_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS &&
-      !entry->config_limit_logged) {
+  if (entry->missing_param_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS &&
+      !entry->missing_param_limit_logged) {
     log_debug("  [SCAN] attempt limit reached (%u), skipping path: %s",
               (unsigned)MAX_MISSING_PARAM_SCAN_ATTEMPTS, path);
-    entry->config_limit_logged = true;
+    entry->missing_param_limit_logged = true;
   }
 }
 
 static void clear_missing_param_entry(const char *path) {
-  struct AttemptCache *entry = find_attempt_entry(path);
+  struct PathStateEntry *entry = find_path_state(path);
   if (!entry)
     return;
-  entry->config_attempts = 0;
-  entry->config_limit_logged = false;
+  entry->missing_param_attempts = 0;
+  entry->missing_param_limit_logged = false;
 }
 
-static uint8_t get_failed_mount_attempts(const char *path, const char *title_id) {
-  struct AttemptCache *entry = find_attempt_entry(path);
-  if (!entry)
-    return 0;
-  update_attempt_title_id(entry, title_id);
-  return entry->mount_reg_attempts;
+static uint8_t get_failed_mount_attempts(const char *title_id) {
+  struct TitleStateEntry *entry = find_title_state(title_id);
+  return entry ? entry->mount_reg_attempts : 0;
 }
 
-static void clear_failed_mount_attempts(const char *path, const char *title_id) {
-  struct AttemptCache *entry = find_attempt_entry(path);
-  if (!entry)
-    return;
-  update_attempt_title_id(entry, title_id);
-  entry->mount_reg_attempts = 0;
+static void clear_failed_mount_attempts(const char *title_id) {
+  struct TitleStateEntry *entry = find_title_state(title_id);
+  if (entry)
+    entry->mount_reg_attempts = 0;
 }
 
-static uint8_t bump_failed_mount_attempts(const char *path,
-                                          const char *title_id) {
-  struct AttemptCache *entry = get_or_create_attempt_entry(path);
+static uint8_t bump_failed_mount_attempts(const char *title_id) {
+  struct TitleStateEntry *entry = get_or_create_title_state(title_id);
   if (!entry)
     return MAX_FAILED_MOUNT_ATTEMPTS;
-  update_attempt_title_id(entry, title_id);
   if (entry->mount_reg_attempts < UINT8_MAX)
     entry->mount_reg_attempts++;
   return entry->mount_reg_attempts;
 }
 
 static bool is_image_mount_limited(const char *path) {
-  struct AttemptCache *entry = find_attempt_entry(path);
-  if (!entry)
-    return false;
-  return entry->image_mount_attempts >= MAX_IMAGE_MOUNT_ATTEMPTS;
+  struct PathStateEntry *entry = find_path_state(path);
+  return entry ? entry->image_mount_attempts >= MAX_IMAGE_MOUNT_ATTEMPTS : false;
 }
 
 static uint8_t bump_image_mount_attempts(const char *path) {
-  struct AttemptCache *entry = get_or_create_attempt_entry(path);
+  struct PathStateEntry *entry = get_or_create_path_state(path);
   if (!entry)
     return MAX_IMAGE_MOUNT_ATTEMPTS;
   if (entry->image_mount_attempts < UINT8_MAX)
@@ -517,13 +762,14 @@ static uint8_t bump_image_mount_attempts(const char *path) {
 }
 
 static void clear_image_mount_attempts(const char *path) {
-  struct AttemptCache *entry = find_attempt_entry(path);
+  struct PathStateEntry *entry = find_path_state(path);
   if (!entry)
     return;
   entry->image_mount_attempts = 0;
   entry->image_mount_limit_logged = false;
 }
 
+// --- Active Mount and NullFS Session Caches ---
 static void cache_ufs_mount(const char *path, int unit_id,
                             attach_backend_t backend) {
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
@@ -536,7 +782,7 @@ static void cache_ufs_mount(const char *path, int unit_id,
 
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
     if (!ufs_cache[k].valid) {
-      copy_cstr(ufs_cache[k].path, sizeof(ufs_cache[k].path), path);
+      (void)strlcpy(ufs_cache[k].path, path, sizeof(ufs_cache[k].path));
       ufs_cache[k].unit_id = unit_id;
       ufs_cache[k].backend = backend;
       ufs_cache[k].valid = true;
@@ -554,8 +800,8 @@ static void cache_nullfs_mount(const char *mount_point) {
   }
   for (int k = 0; k < MAX_NULLFS_MOUNTS; k++) {
     if (!nullfs_cache[k].valid) {
-      copy_cstr(nullfs_cache[k].mount_point, sizeof(nullfs_cache[k].mount_point),
-                mount_point);
+      (void)strlcpy(nullfs_cache[k].mount_point, mount_point,
+                    sizeof(nullfs_cache[k].mount_point));
       nullfs_cache[k].valid = true;
       return;
     }
@@ -574,6 +820,7 @@ static void invalidate_nullfs_mount(const char *mount_point) {
   }
 }
 
+// --- Shutdown and Stop Signal Handling ---
 static void on_signal(int sig) {
   (void)sig;
   g_stop_requested = 1;
@@ -635,6 +882,9 @@ void log_to_file(const char *fmt, va_list args) {
   }
 }
 void log_debug(const char *fmt, ...) {
+  if (!g_runtime_cfg_ready || !g_runtime_cfg.debug_enabled)
+    return;
+
   va_list args;
   va_list args_copy;
   va_start(args, fmt);
@@ -705,35 +955,269 @@ static bool read_mount_link(const char *title_id, char *out, size_t out_size) {
   return out[0] != '\0';
 }
 
+static void build_system_ex_app_path(const char *title_id, char *out,
+                                     size_t out_size) {
+  if (out_size == 0)
+    return;
+  snprintf(out, out_size, "/system_ex/app/%s", title_id);
+}
+
+static bool mount_link_matches_system_ex(const char *title_id) {
+  char tracked_path[MAX_PATH];
+  char expected_path[MAX_PATH];
+  if (!read_mount_link(title_id, tracked_path, sizeof(tracked_path)))
+    return false;
+  build_system_ex_app_path(title_id, expected_path, sizeof(expected_path));
+  return strcmp(tracked_path, expected_path) == 0;
+}
+
+// --- app.db Access Layer ---
+static void close_app_db(void) {
+  if (g_app_db_stmt_has_title) {
+    sqlite3_finalize(g_app_db_stmt_has_title);
+    g_app_db_stmt_has_title = NULL;
+  }
+  if (g_app_db_stmt_update_snd0) {
+    sqlite3_finalize(g_app_db_stmt_update_snd0);
+    g_app_db_stmt_update_snd0 = NULL;
+  }
+  if (g_app_db) {
+    sqlite3_close(g_app_db);
+    g_app_db = NULL;
+  }
+}
+
+static bool ensure_app_db_open(void) {
+  if (!g_app_db) {
+    if (sqlite3_open(APP_DB_PATH, &g_app_db) != SQLITE_OK) {
+      log_debug("  [DB] open failed: %s",
+                (g_app_db ? sqlite3_errmsg(g_app_db) : APP_DB_PATH));
+      close_app_db();
+      return false;
+    }
+    (void)sqlite3_busy_timeout(g_app_db, APP_DB_BUSY_TIMEOUT_MS);
+  }
+  return true;
+}
+
+static bool ensure_app_db_stmt_has_title_ready(void) {
+  if (g_app_db_stmt_has_title)
+    return true;
+
+  const char *sql = "SELECT 1 FROM tbl_contentinfo WHERE titleId = ?1 LIMIT 1;";
+  for (int attempt = 0; attempt < APP_DB_PREPARE_BUSY_RETRIES; attempt++) {
+    if (!ensure_app_db_open())
+      return false;
+
+    int rc =
+        sqlite3_prepare_v2(g_app_db, sql, -1, &g_app_db_stmt_has_title, NULL);
+    if (rc == SQLITE_OK)
+      return true;
+
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if (attempt + 1 < APP_DB_PREPARE_BUSY_RETRIES && !should_stop_requested()) {
+        close_app_db();
+        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+        continue;
+      }
+    }
+
+    log_debug("  [DB] prepare failed for titleId check: rc=%d err=%s", rc,
+              (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+    close_app_db();
+    return false;
+  }
+
+  close_app_db();
+  return false;
+}
+
+static bool ensure_app_db_stmt_update_snd0_ready(void) {
+  if (g_app_db_stmt_update_snd0)
+    return true;
+
+  const char *sql =
+      "UPDATE tbl_contentinfo "
+      "SET snd0info = '/user/appmeta/' || ?1 || '/snd0.at9' "
+      "WHERE titleId = ?1;";
+  for (int attempt = 0; attempt < APP_DB_PREPARE_BUSY_RETRIES; attempt++) {
+    if (!ensure_app_db_open())
+      return false;
+
+    int rc =
+        sqlite3_prepare_v2(g_app_db, sql, -1, &g_app_db_stmt_update_snd0, NULL);
+    if (rc == SQLITE_OK)
+      return true;
+
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if (attempt + 1 < APP_DB_PREPARE_BUSY_RETRIES && !should_stop_requested()) {
+        close_app_db();
+        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+        continue;
+      }
+    }
+
+    log_debug("  [DB] prepare failed for snd0info update: rc=%d err=%s", rc,
+              (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+    close_app_db();
+    return false;
+  }
+
+  close_app_db();
+  return false;
+}
+
+static int query_title_registered_in_app_db(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return 0;
+
+  for (int attempt = 0; attempt < APP_DB_QUERY_BUSY_RETRIES; attempt++) {
+    if (!ensure_app_db_stmt_has_title_ready())
+      return -1;
+
+    sqlite3_reset(g_app_db_stmt_has_title);
+    sqlite3_clear_bindings(g_app_db_stmt_has_title);
+    if (sqlite3_bind_text(g_app_db_stmt_has_title, 1, title_id, -1,
+                          SQLITE_TRANSIENT) != SQLITE_OK) {
+      log_debug("  [DB] bind failed for titleId check: %s",
+                sqlite3_errmsg(g_app_db));
+      close_app_db();
+      return -1;
+    }
+
+    int rc = sqlite3_step(g_app_db_stmt_has_title);
+    if (rc == SQLITE_ROW || rc == SQLITE_DONE) {
+      int ret = (rc == SQLITE_ROW) ? 1 : 0;
+      // Always reset after stepping, to avoid keeping a cursor/lock open.
+      sqlite3_reset(g_app_db_stmt_has_title);
+      sqlite3_clear_bindings(g_app_db_stmt_has_title);
+      return ret;
+    }
+
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if (attempt + 1 < APP_DB_QUERY_BUSY_RETRIES && !should_stop_requested()) {
+        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+        continue;
+      }
+    }
+
+    if (g_app_db) {
+      log_debug("  [DB] step failed for titleId check: rc=%d err=%s", rc,
+                sqlite3_errmsg(g_app_db));
+    }
+    close_app_db();
+    return -1;
+  }
+
+  close_app_db();
+  return -1;
+}
+
+static int update_snd0info(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return -1;
+  if (!ensure_app_db_stmt_update_snd0_ready())
+    return -1;
+
+  for (int attempt = 0; attempt < APP_DB_UPDATE_BUSY_RETRIES; attempt++) {
+    sqlite3_reset(g_app_db_stmt_update_snd0);
+    sqlite3_clear_bindings(g_app_db_stmt_update_snd0);
+    if (sqlite3_bind_text(g_app_db_stmt_update_snd0, 1, title_id, -1,
+                          SQLITE_TRANSIENT) != SQLITE_OK) {
+      if (g_app_db) {
+        log_debug("  [DB] bind failed for snd0info update: %s",
+                  sqlite3_errmsg(g_app_db));
+      }
+      close_app_db();
+      return -1;
+    }
+
+    int rc = sqlite3_step(g_app_db_stmt_update_snd0);
+    if (rc == SQLITE_DONE) {
+      int changes = sqlite3_changes(g_app_db);
+      close_app_db();
+      return changes;
+    }
+
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if (attempt + 1 < APP_DB_UPDATE_BUSY_RETRIES && !should_stop_requested()) {
+        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+        continue;
+      }
+    }
+
+    if (g_app_db) {
+      log_debug("  [DB] step failed for snd0info update: rc=%d err=%s", rc,
+                sqlite3_errmsg(g_app_db));
+    }
+    close_app_db();
+    return -1;
+  }
+
+  close_app_db();
+  return -1;
+}
+
+static int lookup_title_in_app_db_cached(const char *title_id,
+                                         struct AppDbLookupCache *lookup_cache,
+                                         int *cache_count) {
+  if (!title_id || title_id[0] == '\0')
+    return 0;
+
+  int count = (cache_count ? *cache_count : 0);
+  for (int i = 0; i < count; i++) {
+    if (lookup_cache[i].valid && strcmp(lookup_cache[i].title_id, title_id) == 0)
+      return lookup_cache[i].in_app_db ? 1 : 0;
+  }
+
+  int q = query_title_registered_in_app_db(title_id);
+  if (q < 0)
+    return -1;
+
+  bool in_app_db = (q != 0);
+  if (cache_count && count < MAX_PENDING) {
+    (void)strlcpy(lookup_cache[count].title_id, title_id,
+                  sizeof(lookup_cache[count].title_id));
+    lookup_cache[count].in_app_db = in_app_db;
+    lookup_cache[count].valid = true;
+    *cache_count = count + 1;
+  }
+  return in_app_db ? 1 : 0;
+}
+
 // --- FAST STABILITY CHECK ---
-bool wait_for_stability_fast(const char *path, const char *name) {
+static bool is_path_stable_now(const char *path, double *root_diff_out) {
   struct stat st;
   time_t now = time(NULL);
-
-  // 1. Check Root Folder Timestamp
   if (stat(path, &st) != 0)
     return false;
-  double diff = difftime(now, st.st_mtime);
 
-  // If modified > 10 seconds ago, it's stable.
-  if (diff > 10.0) {
-    // Double check sce_sys just to be sure
-    char sys_path[MAX_PATH];
-    snprintf(sys_path, sizeof(sys_path), "%s/sce_sys", path);
-    if (stat(sys_path, &st) == 0) {
-      if (difftime(now, st.st_mtime) > 10.0) {
-        return true;
-      }
-    } else {
-      return true; // No sce_sys? Trust root.
-    }
-  }
+  double root_diff = difftime(now, st.st_mtime);
+  if (root_diff_out)
+    *root_diff_out = root_diff;
+  if (root_diff <= 10.0)
+    return false;
+
+  char sys_path[MAX_PATH];
+  snprintf(sys_path, sizeof(sys_path), "%s/sce_sys", path);
+  if (stat(sys_path, &st) == 0)
+    return difftime(now, st.st_mtime) > 10.0;
+
+  // No sce_sys? Trust root timestamp.
+  return true;
+}
+
+bool wait_for_stability_fast(const char *path, const char *name) {
+  double diff = 0.0;
+  if (is_path_stable_now(path, &diff))
+    return true;
 
   log_debug("  [WAIT] %s modified %.0fs ago. Waiting...", name, diff);
   sceKernelUsleep(2000000); // Wait 2s
   return false;             // Force re-scan next cycle
 }
 
+// --- Mount/Copy Helpers for Install Action ---
 static int remount_system_ex(void) {
   struct iovec iov[] = {
       IOVEC_ENTRY("from"),      IOVEC_ENTRY("/dev/ssd0.system_ex"),
@@ -890,41 +1374,7 @@ int copy_file(const char *src, const char *dst) {
   return ret;
 }
 
-// --- UFS2 IMAGE MOUNTING (LVD) ---
-static bool build_iovec(struct iovec **iov, int *iovlen, const char *name,
-                        const void *val, size_t len) {
-  int i = *iovlen;
-  if (i < 0)
-    return false;
-  size_t need = (size_t)i + 2u;
-  struct iovec *tmp = realloc(*iov, sizeof(**iov) * need);
-  if (!tmp)
-    return false;
-  *iov = tmp;
-
-  char *name_copy = strdup(name);
-  if (!name_copy)
-    return false;
-
-  (*iov)[i].iov_base = name_copy; 
-  (*iov)[i].iov_len = strlen(name) + 1;
-  i++;
-  (*iov)[i].iov_base = (void *)val;
-  if (len == (size_t)-1)
-    len = val ? strlen((const char *)val) + 1 : 0;
-  (*iov)[i].iov_len = len;
-  *iovlen = i + 1;
-  return true;
-}
-
-static void free_iovec(struct iovec *iov, int iovlen) {
-  if (!iov)
-    return;
-  for (int i = 0; i < iovlen; i += 2)
-    free(iov[i].iov_base);
-  free(iov);
-}
-
+// --- Device Node Wait and Source Stability ---
 static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   for (int i = 0; i < LVD_NODE_WAIT_RETRIES; i++) {
     bool exists = (access(devname, F_OK) == 0);
@@ -962,7 +1412,9 @@ static bool is_source_stable_for_mount(const char *path, const char *name,
   return true;
 }
 
+// --- Runtime Config Parsing ---
 static void init_runtime_config_defaults(void) {
+  g_runtime_cfg.debug_enabled = false;
   g_runtime_cfg.mount_read_only = (IMAGE_MOUNT_READ_ONLY != 0);
   g_runtime_cfg.exfat_backend = DEFAULT_EXFAT_BACKEND;
   g_runtime_cfg.ufs_backend = DEFAULT_UFS_BACKEND;
@@ -971,6 +1423,7 @@ static void init_runtime_config_defaults(void) {
   g_runtime_cfg.lvd_sector_pfs = LVD_SECTOR_SIZE_PFS;
   g_runtime_cfg.md_sector_exfat = MD_SECTOR_SIZE_EXFAT;
   g_runtime_cfg.md_sector_ufs = MD_SECTOR_SIZE_UFS;
+  init_runtime_scan_paths_defaults();
   g_runtime_cfg_ready = true;
 }
 
@@ -1058,6 +1511,7 @@ static bool load_runtime_config(void) {
 
   char line[512];
   int line_no = 0;
+  bool has_custom_scanpaths = false;
   while (fgets(line, sizeof(line), f)) {
     line_no++;
     char *s = trim_ascii(line);
@@ -1092,6 +1546,15 @@ static bool load_runtime_config(void) {
     uint32_t u32 = 0;
     attach_backend_t backend = ATTACH_BACKEND_NONE;
 
+    if (strcasecmp(key, "debug") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      g_runtime_cfg.debug_enabled = bval;
+      continue;
+    }
+
     if (strcasecmp(key, "mount_read_only") == 0 ||
         strcasecmp(key, "read_only") == 0) {
       if (!parse_bool_ini(value, &bval)) {
@@ -1119,6 +1582,18 @@ static bool load_runtime_config(void) {
         continue;
       }
       g_runtime_cfg.ufs_backend = backend;
+      continue;
+    }
+
+    if (strcasecmp(key, "scanpath") == 0) {
+      if (!has_custom_scanpaths) {
+        clear_runtime_scan_paths();
+        has_custom_scanpaths = true;
+      }
+      if (!add_runtime_scan_path(value)) {
+        log_debug("  [CFG] invalid scanpath at line %d: %s=%s", line_no, key,
+                  value);
+      }
       continue;
     }
 
@@ -1165,18 +1640,29 @@ static bool load_runtime_config(void) {
 
   fclose(f);
 
-  log_debug("  [CFG] loaded: ro=%d exfat_backend=%s ufs_backend=%s "
-            "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u)",
+  if (has_custom_scanpaths && g_scan_path_count == 0) {
+    log_debug("  [CFG] no valid scanpath entries, using defaults");
+    init_runtime_scan_paths_defaults();
+  } else {
+    // UFS mount root is always required for remount scanning.
+    (void)add_runtime_scan_path(UFS_MOUNT_BASE);
+  }
+
+  log_debug("  [CFG] loaded: debug=%d ro=%d exfat_backend=%s ufs_backend=%s "
+            "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u) "
+            "scan_paths=%d",
+            g_runtime_cfg.debug_enabled ? 1 : 0,
             g_runtime_cfg.mount_read_only ? 1 : 0,
             backend_name(g_runtime_cfg.exfat_backend),
             backend_name(g_runtime_cfg.ufs_backend),
             g_runtime_cfg.lvd_sector_exfat, g_runtime_cfg.lvd_sector_ufs,
             g_runtime_cfg.lvd_sector_pfs, g_runtime_cfg.md_sector_exfat,
-            g_runtime_cfg.md_sector_ufs);
+            g_runtime_cfg.md_sector_ufs, g_scan_path_count);
 
   return true;
 }
 
+// --- Backend Option Mapping and Mount Flags ---
 static uint32_t get_lvd_sector_size(image_fs_type_t fs_type) {
   ensure_runtime_config_ready();
   switch (fs_type) {
@@ -1198,23 +1684,6 @@ static uint32_t get_md_sector_size(image_fs_type_t fs_type) {
   case IMAGE_FS_EXFAT:
   default:
     return g_runtime_cfg.md_sector_exfat;
-  }
-}
-
-static bool is_mount_read_only(void) {
-  ensure_runtime_config_ready();
-  return g_runtime_cfg.mount_read_only;
-}
-
-static attach_backend_t get_attach_backend_for_fs(image_fs_type_t fs_type) {
-  ensure_runtime_config_ready();
-  switch (fs_type) {
-  case IMAGE_FS_EXFAT:
-    return g_runtime_cfg.exfat_backend;
-  case IMAGE_FS_UFS:
-    return g_runtime_cfg.ufs_backend;
-  default:
-    return ATTACH_BACKEND_LVD;
   }
 }
 
@@ -1242,10 +1711,9 @@ static unsigned int get_nmount_flags(image_fs_type_t fs_type,
                                      bool mount_read_only,
                                      const char **mount_mode_out) {
   if (fs_type == IMAGE_FS_UFS) {
-    unsigned int ufs_opt = mount_read_only ? 1u : 0u;
     if (mount_mode_out)
       *mount_mode_out = mount_read_only ? "dd_ro" : "dd_rw";
-    return UFS_NMOUNT_FLAG_BASE - ((ufs_opt == 0u) - 1u);
+    return mount_read_only ? UFS_NMOUNT_FLAG_RO : UFS_NMOUNT_FLAG_RW;
   }
 
   if (mount_mode_out)
@@ -1268,6 +1736,7 @@ static uint16_t lvd_option_len_from_flags(uint16_t options) {
   return (uint16_t)(8u * ((uint32_t)options & 1u) + 4u);
 }
 
+// --- Mounted Device Resolution (/dev/lvdN, /dev/mdN) ---
 static bool parse_unit_from_dev_path(const char *dev_path, const char *prefix,
                                      int *unit_out) {
   size_t prefix_len = strlen(prefix);
@@ -1309,43 +1778,47 @@ static bool is_active_image_mount_point(const char *path) {
   return resolve_device_from_mount(path, &backend, &unit);
 }
 
-// LVD Detach Helper
-static void detach_lvd_unit(int unit_id) {
+// --- Device Detach Helpers ---
+static bool detach_lvd_unit(int unit_id) {
   if (unit_id < 0)
-    return;
+    return true;
 
   int fd = open(LVD_CTRL_PATH, O_RDWR);
   if (fd < 0) {
     log_debug("  [IMG][%s] open %s for detach failed: %s",
               backend_name(ATTACH_BACKEND_LVD), LVD_CTRL_PATH, strerror(errno));
-    return;
+    return false;
   }
 
   lvd_ioctl_detach_t req;
   memset(&req, 0, sizeof(req));
   req.device_id = unit_id;
 
+  bool ok = true;
   if (ioctl(fd, SCE_LVD_IOC_DETACH, &req) != 0) {
     log_debug("  [IMG][%s] detach %d failed: %s",
               backend_name(ATTACH_BACKEND_LVD), unit_id, strerror(errno));
+    ok = false;
   }
   close(fd);
 
   if (!wait_for_lvd_node_state(unit_id, false)) {
     log_debug("  [IMG][%s] device node still present after detach: /dev/lvd%d",
               backend_name(ATTACH_BACKEND_LVD), unit_id);
+    ok = false;
   }
+  return ok;
 }
 
-static void detach_md_unit(int unit_id) {
+static bool detach_md_unit(int unit_id) {
   if (unit_id < 0)
-    return;
+    return true;
 
   int fd = open(MD_CTRL_PATH, O_RDWR);
   if (fd < 0) {
     log_debug("  [IMG][%s] open %s for detach failed: %s",
               backend_name(ATTACH_BACKEND_MD), MD_CTRL_PATH, strerror(errno));
-    return;
+    return false;
   }
 
   struct md_ioctl req;
@@ -1353,12 +1826,14 @@ static void detach_md_unit(int unit_id) {
   req.md_version = MDIOVERSION;
   req.md_unit = (unsigned int)unit_id;
 
+  bool ok = true;
   if (ioctl(fd, MDIOCDETACH, &req) != 0) {
     int err = errno;
     req.md_options = MD_FORCE;
     if (ioctl(fd, MDIOCDETACH, &req) != 0) {
       log_debug("  [IMG][%s] detach %d failed: %s",
                 backend_name(ATTACH_BACKEND_MD), unit_id, strerror(errno));
+      ok = false;
     } else {
       log_debug("  [IMG][%s] detach %d forced after error: %s",
                 backend_name(ATTACH_BACKEND_MD), unit_id, strerror(err));
@@ -1369,16 +1844,20 @@ static void detach_md_unit(int unit_id) {
   if (!wait_for_md_node_state(unit_id, false)) {
     log_debug("  [IMG][%s] device node still present after detach: /dev/md%d",
               backend_name(ATTACH_BACKEND_MD), unit_id);
+    ok = false;
   }
+  return ok;
 }
 
-static void detach_attached_unit(attach_backend_t backend, int unit_id) {
+static bool detach_attached_unit(attach_backend_t backend, int unit_id) {
   if (backend == ATTACH_BACKEND_MD)
-    detach_md_unit(unit_id);
+    return detach_md_unit(unit_id);
   else if (backend == ATTACH_BACKEND_LVD)
-    detach_lvd_unit(unit_id);
+    return detach_lvd_unit(unit_id);
+  return true;
 }
 
+// --- Image Path and Naming Helpers ---
 static image_fs_type_t detect_image_fs_type(const char *name) {
   const char *dot = strrchr(name, '.');
   if (!dot)
@@ -1448,7 +1927,7 @@ static void build_ufs_mount_point(const char *file_path, image_fs_type_t fs_type
            mount_name, mount_fs_suffix(fs_type));
 }
 
-static void unmount_ufs_image(const char *file_path, int unit_id,
+static bool unmount_ufs_image(const char *file_path, int unit_id,
                               attach_backend_t backend) {
   char mount_point[MAX_PATH];
   image_fs_type_t fs_type = detect_image_fs_type(file_path);
@@ -1479,19 +1958,34 @@ static void unmount_ufs_image(const char *file_path, int unit_id,
   }
 
   if (!can_detach)
-    return;
+    return false;
 
-  if (resolved_backend == ATTACH_BACKEND_NONE) {
-    log_debug("  [IMG][%s] detach skipped for %s (backend unknown)",
-              backend_name(resolved_backend), mount_point);
-    return;
+  bool detach_ok = true;
+  if (resolved_backend != ATTACH_BACKEND_NONE && resolved_unit >= 0)
+    detach_ok = detach_attached_unit(resolved_backend, resolved_unit);
+
+  if (rmdir(mount_point) == 0) {
+    log_debug("  [IMG] Removed mount directory: %s", mount_point);
+    return detach_ok;
   }
 
-  detach_attached_unit(resolved_backend, resolved_unit);
+  int err = errno;
+  if (err == ENOENT)
+    return detach_ok;
+  if (err == ENOTEMPTY || err == EBUSY) {
+    log_debug("  [IMG] Mount directory not removed (%s): %s",
+              strerror(err), mount_point);
+    return detach_ok;
+  }
+  log_debug("  [IMG] Failed to remove mount directory %s: %s", mount_point,
+            strerror(err));
+  return detach_ok;
 }
 
+// --- Image Attach + nmount Pipeline ---
 static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
-  const bool mount_read_only = is_mount_read_only();
+  ensure_runtime_config_ready();
+  const bool mount_read_only = g_runtime_cfg.mount_read_only;
 
   // Check if already in UFS cache
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
@@ -1553,7 +2047,11 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
   mkdir(UFS_MOUNT_BASE, 0777);
   mkdir(mount_point, 0777);
 
-  attach_backend_t attach_backend = get_attach_backend_for_fs(fs_type);
+  attach_backend_t attach_backend = ATTACH_BACKEND_LVD;
+  if (fs_type == IMAGE_FS_EXFAT)
+    attach_backend = g_runtime_cfg.exfat_backend;
+  else if (fs_type == IMAGE_FS_UFS)
+    attach_backend = g_runtime_cfg.ufs_backend;
   log_debug("  [IMG][%s] attach backend selected for %s",
             backend_name(attach_backend), file_path);
 
@@ -1696,56 +2194,58 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
 
   // --- MOUNT FILESYSTEM ---
   struct iovec *iov = NULL;
-  int iovlen = 0;
-  bool iov_ok = false;
+  unsigned int iovlen = 0;
   char mount_errmsg[256];
   memset(mount_errmsg, 0, sizeof(mount_errmsg));
+  const char *sigverify = PFS_MOUNT_SIGVERIFY ? "1" : "0";
+  const char *playgo = PFS_MOUNT_PLAYGO ? "1" : "0";
+  const char *disc = PFS_MOUNT_DISC ? "1" : "0";
+  const char *ekpfs_key = PFS_ZERO_EKPFS_KEY_HEX;
+
+  struct iovec iov_ufs[] = {
+      IOVEC_ENTRY("fstype"), IOVEC_ENTRY("ufs"), IOVEC_ENTRY("from"),
+      IOVEC_ENTRY(devname),  IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point),
+      IOVEC_ENTRY("budgetid"), IOVEC_ENTRY("game"),
+      IOVEC_ENTRY("errmsg"), {(void *)mount_errmsg, sizeof(mount_errmsg)}};
+
+  struct iovec iov_exfat[] = {
+      IOVEC_ENTRY("from"),      IOVEC_ENTRY(devname),
+      IOVEC_ENTRY("fspath"),    IOVEC_ENTRY(mount_point),
+      IOVEC_ENTRY("fstype"),    IOVEC_ENTRY("exfatfs"),
+      IOVEC_ENTRY("large"),     IOVEC_ENTRY("yes"),
+      IOVEC_ENTRY("timezone"),  IOVEC_ENTRY("static"),
+      IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("ignoreacl"), IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
+
+  struct iovec iov_pfs[] = {
+      IOVEC_ENTRY("from"),      IOVEC_ENTRY(devname),
+      IOVEC_ENTRY("fspath"),    IOVEC_ENTRY(mount_point),
+      IOVEC_ENTRY("fstype"),    IOVEC_ENTRY("pfs"),
+      IOVEC_ENTRY("sigverify"), IOVEC_ENTRY(sigverify),
+      IOVEC_ENTRY("mkeymode"),  IOVEC_ENTRY(PFS_MOUNT_MKEYMODE),
+      IOVEC_ENTRY("budgetid"),  IOVEC_ENTRY(PFS_MOUNT_BUDGET_ID),
+      IOVEC_ENTRY("playgo"),    IOVEC_ENTRY(playgo),
+      IOVEC_ENTRY("disc"),      IOVEC_ENTRY(disc),
+      IOVEC_ENTRY("ekpfs"),     IOVEC_ENTRY(ekpfs_key),
+      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
 
   if (fs_type == IMAGE_FS_UFS) {
-    iov_ok = build_iovec(&iov, &iovlen, "fstype", "ufs", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "from", devname, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "fspath", mount_point, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "budgetid", "game", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "errmsg", mount_errmsg,
-                         sizeof(mount_errmsg));
+    iov = iov_ufs;
+    iovlen = (unsigned int)IOVEC_SIZE(iov_ufs);
   } else if (fs_type == IMAGE_FS_EXFAT) {
-    iov_ok = build_iovec(&iov, &iovlen, "from", devname, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "fspath", mount_point, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "fstype", "exfatfs", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "large", "yes", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "timezone", "static", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "async", NULL, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "ignoreacl", NULL, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "errmsg", mount_errmsg,
-                         sizeof(mount_errmsg));
+    iov = iov_exfat;
+    iovlen = (unsigned int)IOVEC_SIZE(iov_exfat);
   } else if (fs_type == IMAGE_FS_PFS) {
-    const char *sigverify = PFS_MOUNT_SIGVERIFY ? "1" : "0";
-    const char *playgo = PFS_MOUNT_PLAYGO ? "1" : "0";
-    const char *disc = PFS_MOUNT_DISC ? "1" : "0";
-    const char *ekpfs_key = PFS_ZERO_EKPFS_KEY_HEX;
     log_debug("  [IMG][%s] PFS ro=%d budgetid=%s mkeymode=%s "
               "sigverify=%s playgo=%s disc=%s ekpfs=zero",
               backend_name(attach_backend), mount_read_only ? 1 : 0,
               PFS_MOUNT_BUDGET_ID, PFS_MOUNT_MKEYMODE, sigverify, playgo, disc);
-
-    iov_ok = build_iovec(&iov, &iovlen, "from", devname, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "fspath", mount_point, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "fstype", "pfs", (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "sigverify", sigverify, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "mkeymode", PFS_MOUNT_MKEYMODE,
-                         (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "budgetid", PFS_MOUNT_BUDGET_ID,
-                         (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "playgo", playgo, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "disc", disc, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "ekpfs", ekpfs_key, (size_t)-1) &&
-             build_iovec(&iov, &iovlen, "errmsg", mount_errmsg,
-                         sizeof(mount_errmsg));
-  }
-  if (!iov_ok) {
-    log_debug("  [IMG][%s] build_iovec failed for fstype=%s",
-              backend_name(attach_backend), image_fs_name(fs_type));
-    free_iovec(iov, iovlen);
+    iov = iov_pfs;
+    iovlen = (unsigned int)IOVEC_SIZE(iov_pfs);
+  } else {
+    log_debug("  [IMG][%s] unsupported fstype=%s", backend_name(attach_backend),
+              image_fs_name(fs_type));
     detach_attached_unit(attach_backend, unit_id);
     return false;
   }
@@ -1753,7 +2253,7 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
   const char *mount_mode = NULL;
   unsigned int mount_flags =
       get_nmount_flags(fs_type, mount_read_only, &mount_mode);
-  ret = nmount(iov, (unsigned int)iovlen, (int)mount_flags);
+  ret = nmount(iov, iovlen, (int)mount_flags);
   if (ret != 0) {
     int mount_errno = errno;
     if (mount_errmsg[0] != '\0') {
@@ -1762,11 +2262,9 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
     }
     log_debug("  [IMG][%s] nmount %s failed: %s",
               backend_name(attach_backend), mount_mode, strerror(mount_errno));
-    free_iovec(iov, iovlen);
     detach_attached_unit(attach_backend, unit_id);
     return false;
   }
-  free_iovec(iov, iovlen);
 
   log_debug("  [IMG][%s] Mounted (%s) %s -> %s", backend_name(attach_backend),
             image_fs_name(fs_type), devname, mount_point);
@@ -1777,78 +2275,46 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
   return true;
 }
 
-static void scan_ufs_images() {
+// --- Image Mount Lifecycle (scan/removal) ---
+static void cleanup_stale_image_mounts(void) {
   if (should_stop_requested())
     return;
 
-  // UFS cache handles mount/unmount lifecycle only.
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
     if (should_stop_requested())
       return;
     if (ufs_cache[k].valid && access(ufs_cache[k].path, F_OK) != 0) {
       log_debug("  [IMG][%s] Source removed, unmounting: %s",
                 backend_name(ufs_cache[k].backend), ufs_cache[k].path);
-      unmount_ufs_image(ufs_cache[k].path, ufs_cache[k].unit_id,
-                        ufs_cache[k].backend);
-      ufs_cache[k].valid = false;
-    }
-  }
-  prune_attempt_cache();
-
-  for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
-    if (should_stop_requested())
-      return;
-    // Skip the UFS mount base itself to avoid recursion
-    if (strcmp(SCAN_PATHS[i], UFS_MOUNT_BASE) == 0)
-      continue;
-
-    DIR *d = opendir(SCAN_PATHS[i]);
-    if (!d)
-      continue;
-
-    struct dirent *entry;
-    while ((entry = readdir(d)) != NULL) {
-      if (should_stop_requested()) {
-        closedir(d);
-        return;
-      }
-      if (entry->d_name[0] == '.')
-        continue;
-      image_fs_type_t fs_type = detect_image_fs_type(entry->d_name);
-      if (fs_type == IMAGE_FS_UNKNOWN)
-        continue;
-
-      char full_path[MAX_PATH];
-      snprintf(full_path, sizeof(full_path), "%s/%s", SCAN_PATHS[i],
-               entry->d_name);
-
-      // Verify it's a regular file
-      struct stat st;
-      if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode))
-        continue;
-
-      if (!is_source_stable_for_mount(full_path, entry->d_name, "IMG"))
-        continue;
-
-      if (is_image_mount_limited(full_path))
-        continue;
-
-      if (mount_ufs_image(full_path, fs_type)) {
-        clear_image_mount_attempts(full_path);
-      } else {
-        bump_image_mount_attempts(full_path);
+      if (unmount_ufs_image(ufs_cache[k].path, ufs_cache[k].unit_id,
+                            ufs_cache[k].backend)) {
+        ufs_cache[k].valid = false;
       }
     }
-    closedir(d);
   }
+}
+
+static void maybe_mount_image_file(const char *full_path,
+                                   const char *display_name) {
+  image_fs_type_t fs_type = detect_image_fs_type(display_name);
+  if (fs_type == IMAGE_FS_UNKNOWN)
+    return;
+  if (!is_source_stable_for_mount(full_path, display_name, "IMG"))
+    return;
+  if (is_image_mount_limited(full_path))
+    return;
+  if (mount_ufs_image(full_path, fs_type))
+    clear_image_mount_attempts(full_path);
+  else
+    bump_image_mount_attempts(full_path);
 }
 
 static void shutdown_ufs_mounts(void) {
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
     if (!ufs_cache[k].valid)
       continue;
-    unmount_ufs_image(ufs_cache[k].path, ufs_cache[k].unit_id,
-                      ufs_cache[k].backend);
+    (void)unmount_ufs_image(ufs_cache[k].path, ufs_cache[k].unit_id,
+                            ufs_cache[k].backend);
     ufs_cache[k].valid = false;
   }
 }
@@ -1862,7 +2328,7 @@ static void shutdown_nullfs_mounts(void) {
   }
 }
 
-// --- JSON  ---
+// --- Game Metadata Parsing (param.json) ---
 static int extract_json_string(const char *json, const char *key, char *out,
                                size_t out_size) {
   char search[64];
@@ -1887,58 +2353,71 @@ static int extract_json_string(const char *json, const char *key, char *out,
   return 0;
 }
 
-bool get_game_info(const char *base_path, char *out_id, char *out_name) {
+bool get_game_info(const char *base_path, const struct stat *param_st,
+                   char *out_id, char *out_name) {
+  if (!out_id || !out_name)
+    return false;
   out_id[0] = '\0';
   out_name[0] = '\0';
+  if (!base_path || !param_st || !S_ISREG(param_st->st_mode))
+    return false;
+
+  struct PathStateEntry *path_state = get_or_create_path_state(base_path);
+  if (path_state && path_state->game_info_cached &&
+      path_state->game_info_mtime == param_st->st_mtime &&
+      path_state->game_info_size == param_st->st_size &&
+      path_state->game_info_ino == param_st->st_ino) {
+    if (!path_state->game_info_valid)
+      return false;
+    (void)strlcpy(out_id, path_state->game_title_id, MAX_TITLE_ID);
+    (void)strlcpy(out_name, path_state->game_title_name, MAX_TITLE_NAME);
+    return true;
+  }
+
+  if (param_st->st_size <= 0 || param_st->st_size > 1024 * 1024) {
+    if (path_state) {
+      path_state->game_info_cached = true;
+      path_state->game_info_valid = false;
+      path_state->game_info_mtime = param_st->st_mtime;
+      path_state->game_info_size = param_st->st_size;
+      path_state->game_info_ino = param_st->st_ino;
+      path_state->game_title_id[0] = '\0';
+      path_state->game_title_name[0] = '\0';
+    }
+    return false;
+  }
 
   char path[MAX_PATH];
   snprintf(path, sizeof(path), "%s/sce_sys/param.json", base_path);
   FILE *f = fopen(path, "rb");
-  if (!f)
+  if (!f) {
+    if (path_state) {
+      path_state->game_info_cached = true;
+      path_state->game_info_valid = false;
+      path_state->game_info_mtime = param_st->st_mtime;
+      path_state->game_info_size = param_st->st_size;
+      path_state->game_info_ino = param_st->st_ino;
+      path_state->game_title_id[0] = '\0';
+      path_state->game_title_name[0] = '\0';
+    }
     return false;
+  }
 
-  size_t cap = 4096;
-  size_t len = 0;
-  char *buf = (char *)malloc(cap + 1);
+  size_t len = (size_t)param_st->st_size;
+  char *buf = (char *)malloc(len + 1);
   if (!buf) {
     fclose(f);
     return false;
   }
-
-  bool read_ok = true;
-  while (read_ok) {
-    if (len == cap) {
-      if (cap > (SIZE_MAX / 2)) {
-        read_ok = false;
-        break;
-      }
-      size_t new_cap = cap * 2;
-      char *tmp = (char *)realloc(buf, new_cap + 1);
-      if (!tmp) {
-        read_ok = false;
-        break;
-      }
-      buf = tmp;
-      cap = new_cap;
-    }
-
-    size_t chunk = cap - len;
-    size_t n = fread(buf + len, 1, chunk, f);
-    len += n;
-    if (n < chunk) {
-      if (ferror(f))
-        read_ok = false;
-      break;
-    }
-  }
+  bool read_ok = (fread(buf, 1, len, f) == len);
   fclose(f);
-
-  if (!read_ok || len == 0) {
+  if (!read_ok) {
     free(buf);
     return false;
   }
-
   buf[len] = '\0';
+
+  bool valid = false;
   int res = extract_json_string(buf, "titleId", out_id, MAX_TITLE_ID);
   if (res != 0)
     res = extract_json_string(buf, "title_id", out_id, MAX_TITLE_ID);
@@ -1948,84 +2427,305 @@ bool get_game_info(const char *base_path, char *out_id, char *out_name) {
     if (extract_json_string(search_start, "titleName", out_name,
                             MAX_TITLE_NAME) != 0)
       extract_json_string(buf, "titleName", out_name, MAX_TITLE_NAME);
-    if (strlen(out_name) == 0)
-      copy_cstr(out_name, MAX_TITLE_NAME, out_id);
-    free(buf);
-    return true;
+    if (out_name[0] == '\0')
+      (void)strlcpy(out_name, out_id, MAX_TITLE_NAME);
+    valid = true;
   }
   free(buf);
+
+  if (path_state) {
+    path_state->game_info_cached = true;
+    path_state->game_info_valid = valid;
+    path_state->game_info_mtime = param_st->st_mtime;
+    path_state->game_info_size = param_st->st_size;
+    path_state->game_info_ino = param_st->st_ino;
+    if (valid) {
+      (void)strlcpy(path_state->game_title_id, out_id,
+                    sizeof(path_state->game_title_id));
+      (void)strlcpy(path_state->game_title_name, out_name,
+                    sizeof(path_state->game_title_name));
+    } else {
+      path_state->game_title_id[0] = '\0';
+      path_state->game_title_name[0] = '\0';
+    }
+  }
+  return valid;
+}
+
+static void prune_game_cache(void) {
+  for (int k = 0; k < MAX_PENDING; k++) {
+    if (!cache[k].valid)
+      continue;
+    if (access(cache[k].path, F_OK) == 0)
+      continue;
+    cache[k].valid = false;
+    cache[k].path[0] = '\0';
+    cache[k].title_id[0] = '\0';
+    cache[k].title_name[0] = '\0';
+  }
+}
+
+static bool directory_has_param_json(const char *dir_path,
+                                     struct stat *param_st_out) {
+  if (!dir_path || dir_path[0] == '\0')
+    return false;
+
+  int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
+  if (dir_fd < 0)
+    return false;
+
+  bool ok = false;
+  struct stat st;
+  if (fstatat(dir_fd, "sce_sys", &st, 0) == 0 && S_ISDIR(st.st_mode) &&
+      fstatat(dir_fd, "sce_sys/param.json", &st, 0) == 0 &&
+      S_ISREG(st.st_mode)) {
+    ok = true;
+    if (param_st_out)
+      *param_st_out = st;
+  }
+
+  close(dir_fd);
+  return ok;
+}
+
+static bool is_under_discovered_param_root(
+    const char *path, char discovered_param_roots[][MAX_PATH],
+    int discovered_count) {
+  if (!path)
+    return false;
+  for (int i = 0; i < discovered_count; i++) {
+    const char *root = discovered_param_roots[i];
+    if (root[0] == '\0')
+      continue;
+    size_t root_len = strlen(root);
+    if (root_len == 0)
+      continue;
+    if (strncmp(path, root, root_len) != 0)
+      continue;
+    char tail = path[root_len];
+    if (tail == '\0' || tail == '/')
+      return true;
+  }
   return false;
 }
 
-// --- COUNTING ---
-int count_new_candidates() {
-  int count = 0;
-  size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
+// --- Candidate Discovery ---
+static bool try_collect_candidate_for_directory(
+    const char *full_path, scan_candidate_t *candidates, int max_candidates,
+    int *candidate_count, struct AppDbLookupCache *db_cache,
+    int *db_cache_count, char discovered_param_roots[][MAX_PATH],
+    int *discovered_param_root_count) {
+  struct stat param_st;
+  memset(&param_st, 0, sizeof(param_st));
+  bool has_param_json = false;
+  char title_id[MAX_TITLE_ID];
+  char title_name[MAX_TITLE_NAME];
+  title_id[0] = '\0';
+  title_name[0] = '\0';
+
+  if (is_under_discovered_param_root(full_path, discovered_param_roots,
+                                     *discovered_param_root_count)) {
+    log_debug("  [SKIP] under discovered game root: %s", full_path);
+    return true;
+  }
+
+  has_param_json = directory_has_param_json(full_path, &param_st);
+
+  if (is_under_ufs_mount_base(full_path) && !is_active_image_mount_point(full_path)) {
+    log_debug("  [SKIP] inactive mount path: %s", full_path);
+    return has_param_json;
+  }
+
+  if (!has_param_json) {
+    if (is_missing_param_scan_limited(full_path)) {
+      log_debug("  [SKIP] param.json retry limit reached: %s", full_path);
+    } else {
+      record_missing_param_failure(full_path);
+    }
+    return false;
+  }
+
+  if (!get_game_info(full_path, &param_st, title_id, title_name)) {
+    record_missing_param_failure(full_path);
+    log_debug("  [SKIP] game info unavailable: %s", full_path);
+    return true;
+  }
+
+  if (!is_under_discovered_param_root(full_path, discovered_param_roots,
+                                      *discovered_param_root_count) &&
+      *discovered_param_root_count < MAX_PENDING) {
+    (void)strlcpy(discovered_param_roots[*discovered_param_root_count], full_path,
+                  MAX_PATH);
+    (*discovered_param_root_count)++;
+  }
+  clear_missing_param_entry(full_path);
+
+  for (int i = 0; i < *candidate_count; i++) {
+    if (strcmp(candidates[i].title_id, title_id) == 0) {
+      log_debug("  [SKIP] title already queued in this cycle: %s (%s)", title_name,
+                title_id);
+      return true;
+    }
+  }
+
+  int in_app_db_q = lookup_title_in_app_db_cached(title_id, db_cache, db_cache_count);
+  if (in_app_db_q < 0) {
+    // app.db is busy/locked right now; defer install/remount decisions to a later scan.
+    log_debug("  [SKIP] app.db unavailable (locked/busy), deferring: %s (%s)",
+              title_name, title_id);
+    return true;
+  }
+  bool in_app_db = (in_app_db_q != 0);
+
+  if (in_app_db) {
+    for (int k = 0; k < MAX_PENDING; k++) {
+      if (!cache[k].valid)
+        continue;
+      if (strcmp(cache[k].path, full_path) == 0 ||
+          (title_id[0] != '\0' && strcmp(cache[k].title_id, title_id) == 0)) {
+        log_debug("  [SKIP] already cached in this session: %s (%s) path=%s",
+                  title_name, title_id, full_path);
+        return true;
+      }
+    }
+  }
+
+  if (!in_app_db && was_register_attempted(title_id)) {
+    log_debug("  [SKIP] register/install already attempted once: %s (%s)",
+              title_name, title_id);
+    return true;
+  }
+
+  // Installed status requires both app files and app.db presence.
+  bool installed = is_installed(title_id) && in_app_db;
+  bool mounted = is_data_mounted(title_id);
+  if (installed && mounted && mount_link_matches_system_ex(title_id)) {
+    log_debug("  [SKIP] already installed+mounted: %s (%s)", title_name, title_id);
+    return true;
+  }
+
+  uint8_t failed_attempts = get_failed_mount_attempts(title_id);
+  if (failed_attempts >= MAX_FAILED_MOUNT_ATTEMPTS) {
+    log_debug("  [SKIP] mount/register retry limit reached (%u/%u): %s (%s)",
+              (unsigned)failed_attempts, (unsigned)MAX_FAILED_MOUNT_ATTEMPTS,
+              title_name, title_id);
+    return true;
+  }
+
+  if (!wait_for_stability_fast(full_path, title_name)) {
+    log_debug("  [SKIP] source not stable yet: %s (%s)", title_name, full_path);
+    return true;
+  }
+
+  if (*candidate_count >= max_candidates) {
+    log_debug("  [SKIP] candidate queue full (%d): %s (%s)", max_candidates,
+              title_name, title_id);
+    return true;
+  }
+
+  (void)strlcpy(candidates[*candidate_count].path, full_path,
+                sizeof(candidates[*candidate_count].path));
+  (void)strlcpy(candidates[*candidate_count].title_id, title_id,
+                sizeof(candidates[*candidate_count].title_id));
+  (void)strlcpy(candidates[*candidate_count].title_name, title_name,
+                sizeof(candidates[*candidate_count].title_name));
+  candidates[*candidate_count].installed = installed;
+  candidates[*candidate_count].in_app_db = in_app_db;
+  (*candidate_count)++;
+  return true;
+}
+
+// --- Unified Scan Pass (images + game candidates) ---
+static int collect_scan_candidates(scan_candidate_t *candidates,
+                                   int max_candidates) {
+  int candidate_count = 0;
+  struct AppDbLookupCache *db_cache = g_scan_db_lookup_cache;
+  int db_cache_count = 0;
+  char (*discovered_param_roots)[MAX_PATH] = g_scan_discovered_param_roots;
+  int discovered_param_root_count = 0;
+  memset(db_cache, 0, sizeof(g_scan_db_lookup_cache));
+  memset(discovered_param_roots, 0, sizeof(g_scan_discovered_param_roots));
+
+  cleanup_stale_image_mounts();
+  prune_path_state();
+  prune_game_cache();
+
   for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
     if (should_stop_requested())
-      break;
+      goto done;
+
+    bool scan_images_in_root = (strcmp(SCAN_PATHS[i], UFS_MOUNT_BASE) != 0);
     DIR *d = opendir(SCAN_PATHS[i]);
     if (!d)
       continue;
+
+    if (is_under_discovered_param_root(SCAN_PATHS[i], discovered_param_roots,
+                                       discovered_param_root_count)) {
+      log_debug("  [SKIP] scan root under discovered game root: %s",
+                SCAN_PATHS[i]);
+      closedir(d);
+      continue;
+    }
+
+    // Check the scan root itself first. If it already has sce_sys/param.json
+    // (or belongs to an already discovered game root), skip scanning children.
+    if (try_collect_candidate_for_directory(
+            SCAN_PATHS[i], candidates, max_candidates, &candidate_count, db_cache,
+            &db_cache_count, discovered_param_roots,
+            &discovered_param_root_count)) {
+      closedir(d);
+      continue;
+    }
+
     struct dirent *entry;
     while ((entry = readdir(d)) != NULL) {
       if (should_stop_requested()) {
         closedir(d);
-        return count;
+        goto done;
       }
       if (entry->d_name[0] == '.')
         continue;
+
       char full_path[MAX_PATH];
       snprintf(full_path, sizeof(full_path), "%s/%s", SCAN_PATHS[i],
                entry->d_name);
-      if (strncmp(full_path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
-          (full_path[ufs_prefix_len] == '/' || full_path[ufs_prefix_len] == '\0') &&
-          !is_active_image_mount_point(full_path)) {
-        continue;
-      }
-      if (is_missing_param_scan_limited(full_path))
-        continue;
 
-      char title_id[MAX_TITLE_ID];
-      char title_name[MAX_TITLE_NAME];
-      if (!get_game_info(full_path, title_id, title_name)) {
-        record_missing_param_failure(full_path);
-        continue;
-      }
-      clear_missing_param_entry(full_path);
-      bool installed = is_installed(title_id);
-      bool mounted = is_data_mounted(title_id);
-      if (installed && mounted) {
-        char tracked_path[MAX_PATH];
-        if (read_mount_link(title_id, tracked_path, sizeof(tracked_path)) &&
-            strcmp(tracked_path, full_path) == 0) {
-          continue;
+      bool is_dir = false;
+      bool is_regular = false;
+      if (entry->d_type == DT_DIR) {
+        is_dir = true;
+      } else if (entry->d_type == DT_REG) {
+        is_regular = true;
+      } else if (entry->d_type == DT_UNKNOWN) {
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+          is_dir = S_ISDIR(st.st_mode);
+          is_regular = S_ISREG(st.st_mode);
         }
       }
-      if (get_failed_mount_attempts(full_path, title_id) >=
-          MAX_FAILED_MOUNT_ATTEMPTS) {
-        continue;
-      }
 
-      bool already_seen = false;
-      for (int k = 0; k < MAX_PENDING; k++) {
-        if (cache[k].valid && strcmp(cache[k].path, full_path) == 0) {
-          already_seen = true;
-          break;
-        }
-      }
-      if (already_seen)
+      if (scan_images_in_root && is_regular)
+        maybe_mount_image_file(full_path, entry->d_name);
+      if (!is_dir)
         continue;
 
-      count++;
+      (void)try_collect_candidate_for_directory(
+          full_path, candidates, max_candidates, &candidate_count, db_cache,
+          &db_cache_count, discovered_param_roots,
+          &discovered_param_root_count);
     }
     closedir(d);
   }
-  return count;
+done:
+  // Keep app.db open only during a single scan cycle.
+  close_app_db();
+  return candidate_count;
 }
 
+// --- Install/Remount Action ---
 bool mount_and_install(const char *src_path, const char *title_id,
-                       const char *title_name, bool is_remount) {
+                       const char *title_name, bool is_remount,
+                       bool should_register) {
   char system_ex_app[MAX_PATH];
   char user_app_dir[MAX_PATH];
   char user_sce_sys[MAX_PATH];
@@ -2033,12 +2733,8 @@ bool mount_and_install(const char *src_path, const char *title_id,
   bool nullfs_mounted = false;
 
   // MOUNT
-  snprintf(system_ex_app, sizeof(system_ex_app), "/system_ex/app/%s", title_id);
+  build_system_ex_app_path(title_id, system_ex_app, sizeof(system_ex_app));
   mkdir(system_ex_app, 0777);
-  if (remount_system_ex() != 0) {
-    log_debug("  [MOUNT] remount_system_ex failed: %s", strerror(errno));
-    return false;
-  }
   if (unmount(system_ex_app, 0) != 0 && errno != ENOENT && errno != EINVAL) {
     log_debug("  [MOUNT] pre-unmount failed for %s: %s, trying force...",
               system_ex_app, strerror(errno));
@@ -2088,21 +2784,47 @@ bool mount_and_install(const char *src_path, const char *title_id,
   // WRITE TRACKER
   char lnk_path[MAX_PATH];
   snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", title_id);
+  bool link_ok = false;
   FILE *flnk = fopen(lnk_path, "w");
   if (flnk) {
-    fprintf(flnk, "%s", src_path);
-    fclose(flnk);
+    bool write_ok = (fprintf(flnk, "%s", system_ex_app) >= 0);
+    bool flush_ok = (fflush(flnk) == 0);
+    bool close_ok = (fclose(flnk) == 0);
+    if (write_ok && flush_ok && close_ok) {
+      link_ok = true;
+    } else {
+      log_debug("  [LINK] write failed for %s: %s", lnk_path, strerror(errno));
+    }
+  } else {
+    log_debug("  [LINK] open failed for %s: %s", lnk_path, strerror(errno));
+  }
+  if (!link_ok) {
+    if (nullfs_mounted)
+      unmount_nullfs_mount(system_ex_app);
+    return false;
+  }
+
+  if (!should_register) {
+    log_debug("  [REG] Skip (already present in app.db)");
+    return true;
   }
 
   // REGISTER
+  mark_register_attempted(title_id);
   int res = sceAppInstUtilAppInstallTitleDir(title_id, "/user/app/", 0);
   sceKernelUsleep(200000);
 
   if (res == 0) {
     log_debug("  [REG] Installed NEW!");
     trigger_rich_toast(title_id, title_name, "Installed");
+    int snd0_updates = update_snd0info(title_id);
+    if (snd0_updates >= 0)
+      log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
   } else if ((uint32_t)res == 0x80990002u) {
     log_debug("  [REG] Restored.");
+    int snd0_updates = update_snd0info(title_id);
+    if (snd0_updates >= 0)
+      log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
     // Silent on restore/remount to avoid spam
   } else {
     log_debug("  [REG] FAIL: 0x%x", res);
@@ -2113,114 +2835,57 @@ bool mount_and_install(const char *src_path, const char *title_id,
   return true;
 }
 
-void scan_all_paths() {
-  if (should_stop_requested())
+// --- Execution (per discovered candidate) ---
+static void process_scan_candidates(const scan_candidate_t *candidates,
+                                    int candidate_count) {
+  if (remount_system_ex() != 0) {
+    log_debug("  [MOUNT] remount_system_ex failed: %s", strerror(errno));
     return;
-  size_t ufs_prefix_len = strlen(UFS_MOUNT_BASE);
-
-  // Cache Cleaner
-  for (int k = 0; k < MAX_PENDING; k++) {
-    if (should_stop_requested())
-      return;
-    if (cache[k].valid) {
-      if (access(cache[k].path, F_OK) != 0) {
-        cache[k].valid = false;
-      }
-    }
   }
 
-  for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
+  for (int i = 0; i < candidate_count; i++) {
     if (should_stop_requested())
       return;
-    DIR *d = opendir(SCAN_PATHS[i]);
-    if (!d)
-      continue;
 
-    struct dirent *entry;
-    while ((entry = readdir(d)) != NULL) {
-      if (should_stop_requested()) {
-        closedir(d);
-        return;
-      }
+    const scan_candidate_t *c = &candidates[i];
+    bool is_remount = c->installed;
+    bool should_register = !c->in_app_db;
 
-      if (entry->d_name[0] == '.')
-        continue;
-      char full_path[MAX_PATH];
-      snprintf(full_path, sizeof(full_path), "%s/%s", SCAN_PATHS[i],
-               entry->d_name);
-      if (strncmp(full_path, UFS_MOUNT_BASE, ufs_prefix_len) == 0 &&
-          (full_path[ufs_prefix_len] == '/' || full_path[ufs_prefix_len] == '\0') &&
-          !is_active_image_mount_point(full_path)) {
-        continue;
-      }
-      if (is_missing_param_scan_limited(full_path))
-        continue;
+    if (is_remount) {
+      log_debug("  [ACTION] Remounting: %s", c->title_name);
+    } else {
+      log_debug("  [ACTION] Installing: %s (%s)", c->title_name, c->title_id);
+      notify_system("Installing: %s (%s)...", c->title_name, c->title_id);
+    }
 
-      bool already_seen = false;
-      for (int k = 0; k < MAX_PENDING; k++) {
-        if (cache[k].valid && strcmp(cache[k].path, full_path) == 0) {
-          already_seen = true;
-          break;
-        }
-      }
-      if (already_seen)
-        continue;
-
-      char title_id[MAX_TITLE_ID];
-      char title_name[MAX_TITLE_NAME];
-      if (!get_game_info(full_path, title_id, title_name)) {
-        record_missing_param_failure(full_path);
-        continue;
-      }
-      clear_missing_param_entry(full_path);
-
-      // 1. Skip if perfect
-      bool installed = is_installed(title_id);
-      bool mounted = is_data_mounted(title_id);
-      if (installed && mounted) {
-        char tracked_path[MAX_PATH];
-        if (read_mount_link(title_id, tracked_path, sizeof(tracked_path)) &&
-            strcmp(tracked_path, full_path) == 0) {
-          continue;
-        }
-      }
-      if (get_failed_mount_attempts(full_path, title_id) >=
-          MAX_FAILED_MOUNT_ATTEMPTS) {
-        continue;
-      }
-
-      if (!wait_for_stability_fast(full_path, title_name))
-        continue;
-
-      // 2. Decide Action
-      bool is_remount = false;
-      if (installed) {
-        log_debug("  [ACTION] Remounting: %s", title_name);
-        // NOTIFICATION REMOVED FOR REMOUNT
-        is_remount = true;
-      } else {
-        log_debug("  [ACTION] Installing: %s", title_name);
-        notify_system("Installing: %s...", title_name);
-        is_remount = false;
-      }
-
-      if (mount_and_install(full_path, title_id, title_name, is_remount)) {
-        clear_failed_mount_attempts(full_path, title_id);
-        cache_game_entry(full_path, title_id, title_name);
-      } else {
-        uint8_t attempts = bump_failed_mount_attempts(full_path, title_id);
-        if (attempts == MAX_FAILED_MOUNT_ATTEMPTS) {
-          log_debug("  [RETRY] limit reached (%u/%u): %s (%s)",
-                    (unsigned)attempts,
-                    (unsigned)MAX_FAILED_MOUNT_ATTEMPTS, title_name, title_id);
-        }
+    bool ok = mount_and_install(c->path, c->title_id, c->title_name, is_remount,
+                                should_register);
+    if (ok) {
+      clear_failed_mount_attempts(c->title_id);
+      cache_game_entry(c->path, c->title_id, c->title_name);
+    } else {
+      uint8_t failed_attempts = bump_failed_mount_attempts(c->title_id);
+      if (failed_attempts == MAX_FAILED_MOUNT_ATTEMPTS) {
+        log_debug("  [RETRY] limit reached (%u/%u): %s (%s)",
+                  (unsigned)failed_attempts,
+                  (unsigned)MAX_FAILED_MOUNT_ATTEMPTS, c->title_name, c->title_id);
       }
     }
-    closedir(d);
   }
 }
 
-int main() {
+// --- Scan Orchestration ---
+static int scan_all_paths_once(bool execute_actions) {
+  int candidate_count = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
+  if (execute_actions && candidate_count > 0)
+    process_scan_candidates(g_scan_candidates, candidate_count);
+  return candidate_count;
+}
+
+void scan_all_paths(void) { (void)scan_all_paths_once(true); }
+
+// --- Program Entry ---
+int main(void) {
   int lock = -1;
 
   // Initialize services
@@ -2238,6 +2903,9 @@ int main() {
   }
   if (flock(lock, LOCK_EX | LOCK_NB) != 0) {
     if (errno == EWOULDBLOCK || errno == EAGAIN) {
+      printf("[LOCK] Another instance is already running.\n");
+      printf("[LOCK] Stop the first instance by creating %s and retry.\n",
+             KILL_FILE);
       close(lock);
       sceUserServiceTerminate();
       return 0;
@@ -2252,23 +2920,20 @@ int main() {
 
   load_runtime_config();
 
-  log_debug("SHADOWMOUNT+ v1.5beta START exFAT/UFS/LVD/MD");
-
-  // --- MOUNT UFS IMAGES ---
-  scan_ufs_images();
+  log_debug("SHADOWMOUNT+ v%s START exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
 
   // --- STARTUP LOGIC ---
-  int new_games = count_new_candidates();
+  int new_games = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
 
   if (new_games == 0) {
     // SCENARIO A: Nothing to do.
-    notify_system("ShadowMount+ v1.5beta exFAT/UFS: Library Ready.\n- VoidWhisper/Gezine/Earthonion/Drakmor");
+    notify_system("ShadowMount+ v%s exFAT/UFS: Library Ready.",
+                  SHADOWMOUNT_VERSION);
   } else {
     // SCENARIO B: Work needed.
-    notify_system("ShadowMount+ v1.5beta exFAT/UFS: Found %d Games. Executing...", new_games);
-
-    // Run the scan immediately to process them
-    scan_all_paths();
+    notify_system("ShadowMount+ v%s exFAT/UFS\nFound %d Games. Executing...",
+                  SHADOWMOUNT_VERSION, new_games);
+    process_scan_candidates(g_scan_candidates, new_games);
 
     // Completion Message
     notify_system("Library Synchronized.");
@@ -2288,12 +2953,12 @@ int main() {
       break;
     }
 
-    scan_ufs_images();
     scan_all_paths();
   }
 
   shutdown_nullfs_mounts();
   shutdown_ufs_mounts();
+  close_app_db();
   if (lock >= 0) {
     close(lock);
   }
