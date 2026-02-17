@@ -2262,7 +2262,7 @@ int main() {
 
   if (new_games == 0) {
     // SCENARIO A: Nothing to do.
-    notify_system("ShadowMount+ v1.5beta exFAT/UFS: Library Ready.\n- VoidWhisper/Gezine/earthonion/Drakmor");
+    notify_system("ShadowMount+ v1.5beta exFAT/UFS: Library Ready.\n- VoidWhisper/Gezine/Earthonion/Drakmor");
   } else {
     // SCENARIO B: Work needed.
     notify_system("ShadowMount+ v1.5beta exFAT/UFS: Found %d Games. Executing...", new_games);
