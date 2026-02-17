@@ -4,6 +4,11 @@
 # All keys are optional.
 # If a key is missing, built-in defaults are used.
 
+# Debug logging:
+# 1/true/yes/on  -> enable log_debug output to console and /data/shadowmount/debug.log
+# 0/false/no/off -> disable log_debug output (default)
+debug=0
+
 # Global mount mode:
 # 1/true/yes/on/ro  -> read-only mounts
 # 0/false/no/off/rw -> read-write mounts
@@ -31,3 +36,8 @@ pfs_sector_size=32768
 # md_exfat_sector_size=512
 # md_ufs_sector_size=512
 
+# Optional custom scan roots (can be repeated):
+# If at least one scanpath=... is present, only these paths are used.
+# UFS_MOUNT_BASE is always added automatically by the daemon.
+# scanpath=/data/homebrew
+# scanpath=/data/etaHEN/games
