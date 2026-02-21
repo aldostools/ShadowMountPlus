@@ -17,19 +17,19 @@
 
 | Extension | Mounted FS | Attach backend | Status |
 | --- | --- | --- | --- |
-| `.exfat` | `exfatfs` | `LVD` or `MD` (configurable) | Stable |
-| `.ffpkg` | `ufs` | `LVD` or `MD` (configurable) | High performance |
+| `.exfat` | `exfatfs` | `LVD` or `MD` (configurable) | Optimal |
+| `.ffpkg` | `ufs` | `LVD` or `MD` (configurable) | Legacy |
 | `.ffpfs` | `pfs` | `LVD` | Experimental |
 
 Notes:
 - Backend, read-only mode, and sector size can be configured via `/data/shadowmount/config.ini`.
 - Debug logging is enabled by default (`debug=1`) and writes to console plus `/data/shadowmount/debug.log` (set `debug=0` to disable).
-- **On 4.xx firmware, shutting down the console may not work correctly when using image files.**
+- **exFAT is the preferred image filesystem, including on 4.xx firmware, with no known reboot/shutdown issues in typical use.**
 
 ## Recommended FS choice
 
-- Prefer **UFS (`.ffpkg`)** for games that work correctly on UFS: it is generally more performant (~1.5-2.5 x exFAT).
-- Use **exFAT (`.exfat`)** for games that only work from external-disk style layouts, because exFAT is case-insensitive.
+- Prefer **exFAT (`.exfat`)** in most cases: it is generally more performant, case-insensitive, and does not have reboot/shutdown issues in typical use.
+- Use **UFS (`.ffpkg`)** only when specifically needed for compatibility with your game/setup.
 
 ## Runtime config (`/data/shadowmount/config.ini`)
 
@@ -148,7 +148,9 @@ FreeBSD:
 
 Windows:
 - You can create UFS2 images with **UFS2Tool** https://github.com/SvenGDK/UFS2Tool.
-- Recommended output format for this project is `.ffpkg`.
+- Example:
+  - `UFS2Tool.exe newfs  -O 2 -b 32768 -f 4096 -m 0 -i 262144 -D ./APPXXXX ./PPSA12345.ffpkg`
+
 
 ## Installation and usage
 

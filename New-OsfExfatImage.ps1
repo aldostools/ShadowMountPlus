@@ -3,7 +3,7 @@
     PURPOSE
     -------
     Create a RAW image file, mount it via OSFMount as a logical volume,
-    auto-select FAT32/exFAT by image size, and either:
+    format it as exFAT, and either:
       - format + copy + dismount (default), or
       - create + mount only for manual steps.
 
@@ -45,11 +45,10 @@
     NOTES
     -----
     - This script does NOT auto-elevate. Start PowerShell as Administrator.
-    - FS selection is automatic by image size:
-      * < 4 GB  -> FAT32, cluster 65536
-      * >= 4 GB -> exFAT, cluster auto-selected:
-        - large-file sets: 65536
-        - small/mixed-file sets: 32768
+    - Filesystem is always exFAT.
+    - Cluster size is auto-selected:
+      - large-file sets: 65536
+      - small/mixed-file sets: 32768
 #>
 
 [CmdletBinding()]
@@ -245,11 +244,9 @@ function Dismount-OsfVolume([string]$osfPath, [string]$mountPoint, [int]$maxAtte
   return $false
 }
 
-function Invoke-FormatVolume([string]$driveLetter, [string]$fileSystem, [int]$clusterSize, [string]$label) {
+function Invoke-FormatVolume([string]$driveLetter, [int]$clusterSize, [string]$label) {
   $target = "${driveLetter}:"
-  if ($fileSystem -notin @("FAT32", "exFAT")) {
-    throw "Unsupported file system '$fileSystem'. Expected FAT32 or exFAT."
-  }
+  $fileSystem = "exFAT"
   $clusterArg = Format-AllocationUnitArg -clusterSize $clusterSize
   $attempts = @(
     @{ Name = "$fileSystem quick with requested allocation unit"; Args = @($target, "/FS:$fileSystem", "/A:$clusterArg", "/Q", "/V:$label", "/X", "/Y") }
@@ -311,40 +308,23 @@ if (Test-Path $ImagePath) {
 
 [Int64]$expectedBytes = 0
 [string]$osfSizeArg = $null
-[Int64]$FsSwitchThresholdBytes = 4GB
-[int]$Fat32ClusterSize = 65536
-[int]$ExfatClusterSize = 65536
+[int]$ExfatClusterSize = Get-OptimalExfatClusterSize -dir $SourceDir
 [bool]$sizeProvided = -not [string]::IsNullOrWhiteSpace($Size)
-[string]$TargetFs = ""
-[int]$TargetClusterSize = 0
+[int]$TargetClusterSize = $ExfatClusterSize
 
 if (-not $sizeProvided) {
   Write-Host "[Info] Size not provided. Computing an optimal image size from '$SourceDir'..."
-  $fat32Candidate = Get-OptimalImageSizeBytes -dir $SourceDir -clusterBytes $Fat32ClusterSize
-  if ($fat32Candidate -lt $FsSwitchThresholdBytes) {
-    $expectedBytes = $fat32Candidate
-  } else {
-    $ExfatClusterSize = Get-OptimalExfatClusterSize -dir $SourceDir
-    $expectedBytes = Get-OptimalImageSizeBytes -dir $SourceDir -clusterBytes $ExfatClusterSize
-  }
+  $expectedBytes = Get-OptimalImageSizeBytes -dir $SourceDir -clusterBytes $TargetClusterSize
   $osfSizeArg = "$expectedBytes"
 } else {
   $expectedBytes = Parse-SizeToBytes $Size
   $osfSizeArg = $Size
 }
 
-if ($expectedBytes -lt $FsSwitchThresholdBytes) {
-  $TargetFs = "FAT32"
-  $TargetClusterSize = $Fat32ClusterSize
-} else {
-  $TargetFs = "exFAT"
-  $ExfatClusterSize = Get-OptimalExfatClusterSize -dir $SourceDir
-  $TargetClusterSize = $ExfatClusterSize
-}
 if (-not $sizeProvided) {
   Write-Host "[Info] Computed image size: $(Format-Bytes $expectedBytes) ($expectedBytes bytes)."
 }
-Write-Host "[Info] Selected filesystem: $TargetFs (cluster=$TargetClusterSize) for image size $(Format-Bytes $expectedBytes)."
+Write-Host "[Info] Selected filesystem: exFAT (cluster=$TargetClusterSize) for image size $(Format-Bytes $expectedBytes)."
 
 $osf = Find-OSFMountCom
 
@@ -380,8 +360,8 @@ try {
     return
   }
 
-  Write-Host "[2/4] Formatting $dest as $TargetFs (cluster=$TargetClusterSize, label='$Label') via format.com ..."
-  Invoke-FormatVolume -driveLetter $DriveLetter -fileSystem $TargetFs -clusterSize $TargetClusterSize -label $Label
+  Write-Host "[2/4] Formatting $dest as exFAT (cluster=$TargetClusterSize, label='$Label') via format.com ..."
+  Invoke-FormatVolume -driveLetter $DriveLetter -clusterSize $TargetClusterSize -label $Label
 
   if (-not (Test-Path $dest)) { throw "Drive $dest is not accessible after formatting." }
 
@@ -390,6 +370,7 @@ try {
     $SourceDir, $dest,
     "/E", "/COPY:DAT", "/DCOPY:DAT",
     "/R:1", "/W:1",
+    "/NFL", "/NDL",
     "/ETA"
   )
   & robocopy.exe @roboArgs
