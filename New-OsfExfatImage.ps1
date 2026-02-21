@@ -3,7 +3,9 @@
     PURPOSE
     -------
     Create a RAW image file, mount it via OSFMount as a logical volume,
-    auto-select FAT32/exFAT by image size, format it, copy a folder into it, then dismount it.
+    auto-select FAT32/exFAT by image size, and either:
+      - format + copy + dismount (default), or
+      - create + mount only for manual steps.
 
     USAGE (run PowerShell as Administrator)
     --------------------------------------
@@ -22,6 +24,13 @@
          -Label "DATA" `
          -ForceOverwrite
 
+    3) Create empty image and keep mounted (manual format/copy):
+       powershell.exe -ExecutionPolicy Bypass -File .\New-OsfExfatImage.ps1 `
+         -ImagePath "C:\images\data.exfat" `
+         -SourceDir "C:\payload\APPXXXX" `
+         -CreateEmptyAndMount `
+         -ForceOverwrite
+
     PARAMETERS
     ----------
     -ImagePath       Output image file path.
@@ -30,13 +39,17 @@
                      Suffixes: K/M/G/T (1024), k/m/g/t (1000), b (512-byte blocks), or bytes.
     -Label           Volume label.
     -ForceOverwrite  Recreate image if it already exists.
+    -CreateEmptyAndMount
+                     Create and mount image only. Skip format/copy and leave mounted.
 
     NOTES
     -----
     - This script does NOT auto-elevate. Start PowerShell as Administrator.
     - FS selection is automatic by image size:
-      * < 4 GB  -> FAT32, cluster 4096
-      * >= 4 GB -> exFAT, cluster 32768
+      * < 4 GB  -> FAT32, cluster 65536
+      * >= 4 GB -> exFAT, cluster auto-selected:
+        - large-file sets: 65536
+        - small/mixed-file sets: 32768
 #>
 
 [CmdletBinding()]
@@ -52,7 +65,9 @@ param(
 
   [string]$Label = "OSFIMG",
 
-  [switch]$ForceOverwrite
+  [switch]$ForceOverwrite,
+
+  [switch]$CreateEmptyAndMount
 )
 
 Set-StrictMode -Version Latest
@@ -128,39 +143,40 @@ function Get-FreeDriveLetter {
 
 function Get-OptimalImageSizeBytes([string]$dir, [int]$clusterBytes) {
   $cluster = [Int64]$clusterBytes
+  [Int64]$metaFixed = 32MB
+  [Int64]$minSlack = 64MB
+  [Int64]$spareMin = 64MB
+  [Int64]$spareMax = 512MB
+  [Int64]$entryMetaBytes = 256
 
   $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force)
-  $dirs  = @(Get-ChildItem -LiteralPath $dir -Recurse -Directory -Force)
+  $dirs = @(Get-ChildItem -LiteralPath $dir -Recurse -Directory -Force)
 
-  [Int64]$sumAllocated = 0
+  [Int64]$rawFileBytes = 0
+  [Int64]$dataBytes = 0
   foreach ($f in $files) {
     $len = [Int64]$f.Length
-    $alloc = (($len + $cluster - 1) / $cluster) * $cluster
-    $sumAllocated += $alloc
+    $rawFileBytes += $len
+    $dataBytes += [Int64]([Math]::Ceiling($len / [double]$cluster) * $cluster)
   }
 
-  # Metadata estimate (moderate, not bloated)
-  [Int64]$metaEntries = ([Int64]$files.Count * 512) + ([Int64]$dirs.Count * 256)
+  [Int64]$dataClusters = [Int64]([Math]::Ceiling($dataBytes / [double]$cluster))
+  [Int64]$fatBytes = $dataClusters * 4
+  [Int64]$bitmapBytes = [Int64]([Math]::Ceiling($dataClusters / 8.0))
+  [Int64]$entryBytes =
+      (([Int64]$files.Count + [Int64]$dirs.Count) * $entryMetaBytes)
 
-  [Int64]$clustersData = [Int64]([Math]::Ceiling($sumAllocated / [double]$cluster))
-  [Int64]$bitmap = [Int64]([Math]::Ceiling($clustersData / 8.0))   # 1 bit per cluster
-  [Int64]$fat    = $clustersData * 4                                # rough 4 bytes per cluster
+  [Int64]$baseTotal =
+      $dataBytes + $fatBytes + $bitmapBytes + $entryBytes + $metaFixed
+  [Int64]$spareBytes = [Int64]([Math]::Ceiling($baseTotal / 200.0))
+  if ($spareBytes -lt $spareMin) { $spareBytes = $spareMin }
+  if ($spareBytes -gt $spareMax) { $spareBytes = $spareMax }
+  [Int64]$total = $baseTotal + $spareBytes
+  [Int64]$minTotal = $rawFileBytes + $minSlack
+  if ($total -lt $minTotal) { $total = $minTotal }
 
-  [Int64]$baseline = 16MB
-  [Int64]$raw = $sumAllocated + $metaEntries + $bitmap + $fat + $baseline
-
-  # Safety margin: 2% capped to 512 MiB
-  [Int64]$margin = [Int64]([Math]::Ceiling($raw * 0.02))
-  if ($margin -gt 512MB) { $margin = 512MB }
-  if ($margin -lt 8MB)   { $margin = 8MB }
-
-  [Int64]$total = $raw + $margin
-  if ($total -lt 64MB) { $total = 64MB }
-
-  # Align to 1 MiB
   [Int64]$align = 1MB
-  $total = (($total + $align - 1) / $align) * $align
-
+  $total = [Int64]([Math]::Ceiling($total / [double]$align) * $align)
   return $total
 }
 
@@ -180,6 +196,32 @@ function Get-LogicalDriveFileSystem([string]$driveLetter) {
   $logical = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$target'" -ErrorAction SilentlyContinue
   if ($logical) { return [string]$logical.FileSystem }
   return ""
+}
+
+function Get-OptimalExfatClusterSize([string]$dir) {
+  [Int64]$largeFileThreshold = 1MB
+
+  $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force)
+  if ($files.Count -eq 0) { return 32768 }
+
+  [Int64]$rawFileBytes = 0
+  foreach ($f in $files) {
+    $rawFileBytes += [Int64]$f.Length
+  }
+
+  [Int64]$avgFileBytes = [Int64]($rawFileBytes / [Int64]$files.Count)
+  if ($avgFileBytes -ge $largeFileThreshold) { return 65536 }
+  return 32768
+}
+
+function Format-AllocationUnitArg([int]$clusterSize) {
+  if ($clusterSize -ge 1MB -and ($clusterSize % 1MB) -eq 0) {
+    return "{0}M" -f ($clusterSize / 1MB)
+  }
+  if ($clusterSize -ge 1KB -and ($clusterSize % 1KB) -eq 0) {
+    return "{0}K" -f ($clusterSize / 1KB)
+  }
+  return "$clusterSize"
 }
 
 function Dismount-OsfVolume([string]$osfPath, [string]$mountPoint, [int]$maxAttempts = 6) {
@@ -208,9 +250,9 @@ function Invoke-FormatVolume([string]$driveLetter, [string]$fileSystem, [int]$cl
   if ($fileSystem -notin @("FAT32", "exFAT")) {
     throw "Unsupported file system '$fileSystem'. Expected FAT32 or exFAT."
   }
-
+  $clusterArg = Format-AllocationUnitArg -clusterSize $clusterSize
   $attempts = @(
-    @{ Name = "$fileSystem quick with requested allocation unit"; Args = @($target, "/FS:$fileSystem", "/A:$clusterSize", "/Q", "/V:$label", "/X", "/Y") }
+    @{ Name = "$fileSystem quick with requested allocation unit"; Args = @($target, "/FS:$fileSystem", "/A:$clusterArg", "/Q", "/V:$label", "/X", "/Y") }
   )
 
   $lastFormatExitCode = -1
@@ -222,6 +264,14 @@ function Invoke-FormatVolume([string]$driveLetter, [string]$fileSystem, [int]$cl
       $proc = Start-Process -FilePath "format.com" -ArgumentList $attempt.Args -Wait -PassThru -NoNewWindow `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
       $lastFormatExitCode = [int]$proc.ExitCode
+
+      # Show native format.com output in current console.
+      if (Test-Path -LiteralPath $stdoutPath) {
+        Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+      }
+      if (Test-Path -LiteralPath $stderrPath) {
+        Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+      }
     } finally {
       Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
@@ -246,6 +296,7 @@ function Invoke-FormatVolume([string]$driveLetter, [string]$fileSystem, [int]$cl
 
 if (-not (Test-Admin)) { throw "Please run PowerShell as Administrator." }
 if (-not (Test-Path $SourceDir -PathType Container)) { throw "Source directory not found: $SourceDir" }
+if (-not (Test-Path (Join-Path $SourceDir "eboot.bin") -PathType Leaf)) { throw "eboot.bin not found in source directory: $SourceDir" }
 
 # Ensure output directory exists
 $outDir = Split-Path -Parent $ImagePath
@@ -261,21 +312,22 @@ if (Test-Path $ImagePath) {
 [Int64]$expectedBytes = 0
 [string]$osfSizeArg = $null
 [Int64]$FsSwitchThresholdBytes = 4GB
-[int]$Fat32ClusterSize = 4096
-[int]$ExfatClusterSize = 32768
+[int]$Fat32ClusterSize = 65536
+[int]$ExfatClusterSize = 65536
+[bool]$sizeProvided = -not [string]::IsNullOrWhiteSpace($Size)
 [string]$TargetFs = ""
 [int]$TargetClusterSize = 0
 
-if ([string]::IsNullOrWhiteSpace($Size)) {
+if (-not $sizeProvided) {
   Write-Host "[Info] Size not provided. Computing an optimal image size from '$SourceDir'..."
   $fat32Candidate = Get-OptimalImageSizeBytes -dir $SourceDir -clusterBytes $Fat32ClusterSize
   if ($fat32Candidate -lt $FsSwitchThresholdBytes) {
     $expectedBytes = $fat32Candidate
   } else {
+    $ExfatClusterSize = Get-OptimalExfatClusterSize -dir $SourceDir
     $expectedBytes = Get-OptimalImageSizeBytes -dir $SourceDir -clusterBytes $ExfatClusterSize
   }
   $osfSizeArg = "$expectedBytes"
-  Write-Host "[Info] Computed image size: $(Format-Bytes $expectedBytes) ($expectedBytes bytes)."
 } else {
   $expectedBytes = Parse-SizeToBytes $Size
   $osfSizeArg = $Size
@@ -286,7 +338,11 @@ if ($expectedBytes -lt $FsSwitchThresholdBytes) {
   $TargetClusterSize = $Fat32ClusterSize
 } else {
   $TargetFs = "exFAT"
+  $ExfatClusterSize = Get-OptimalExfatClusterSize -dir $SourceDir
   $TargetClusterSize = $ExfatClusterSize
+}
+if (-not $sizeProvided) {
+  Write-Host "[Info] Computed image size: $(Format-Bytes $expectedBytes) ($expectedBytes bytes)."
 }
 Write-Host "[Info] Selected filesystem: $TargetFs (cluster=$TargetClusterSize) for image size $(Format-Bytes $expectedBytes)."
 
@@ -295,13 +351,18 @@ $osf = Find-OSFMountCom
 [string]$DriveLetter = ""
 [string]$MountPoint = ""
 [bool]$Mounted = $false
+[bool]$LeaveMounted = $CreateEmptyAndMount.IsPresent
 
 try {
   $DriveLetter = Get-FreeDriveLetter
   $MountPoint = "${DriveLetter}:"
 
-  Write-Host "[1/4] Creating & mounting the image via OSFMount as a logical volume on $MountPoint ..."
-  $out = & $osf -a -t file -f $ImagePath -s $osfSizeArg -m $MountPoint -o rw 2>&1
+  if ($CreateEmptyAndMount) {
+    Write-Host "[1/2] Creating & mounting the image via OSFMount as a logical volume on $MountPoint ..."
+  } else {
+    Write-Host "[1/4] Creating & mounting the image via OSFMount as a logical volume on $MountPoint ..."
+  }
+  $out = & $osf -a -t file -f $ImagePath -s $osfSizeArg -m $MountPoint -o rw,rem 2>&1
   Write-Host ($out | Out-String).Trim()
   if ($LASTEXITCODE -ne 0) { throw "osfmount.com failed with exit code $LASTEXITCODE." }
   $Mounted = $true
@@ -310,26 +371,35 @@ try {
   }
 
   $dest = "${DriveLetter}:\"
+  if ($CreateEmptyAndMount) {
+    Write-Host "[2/2] Done. Empty image is mounted at $dest."
+    Write-Host "Manual steps:"
+    Write-Host "  1) Format $dest as exFAT (recommended cluster: 64KB for large-file sets, 32KB for small/mixed sets)."
+    Write-Host "  2) Copy contents of '$SourceDir' to $dest."
+    Write-Host "  3) Dismount: `"$osf`" -d -m $MountPoint"
+    return
+  }
+
   Write-Host "[2/4] Formatting $dest as $TargetFs (cluster=$TargetClusterSize, label='$Label') via format.com ..."
   Invoke-FormatVolume -driveLetter $DriveLetter -fileSystem $TargetFs -clusterSize $TargetClusterSize -label $Label
 
   if (-not (Test-Path $dest)) { throw "Drive $dest is not accessible after formatting." }
 
-  Write-Host "[3/4] Copying '$SourceDir' -> '$dest' ..."
+  Write-Host "[3/4] Copying contents of '$SourceDir' -> '$dest' ..."
   $roboArgs = @(
     $SourceDir, $dest,
     "/E", "/COPY:DAT", "/DCOPY:DAT",
     "/R:1", "/W:1",
-    "/NFL", "/NDL", "/NP", "/NJH", "/NJS"
+    "/ETA"
   )
-  & robocopy.exe @roboArgs | Out-Null
+  & robocopy.exe @roboArgs
   $robocopyExitCode = $LASTEXITCODE
   if ($robocopyExitCode -gt 7) { throw "robocopy failed. Exit code: $robocopyExitCode" }
 
   Write-Host "[4/4] Done. Dismounting OSFMount volume..."
 }
 finally {
-  if ($Mounted -and -not [string]::IsNullOrWhiteSpace($MountPoint)) {
+  if ($Mounted -and -not $LeaveMounted -and -not [string]::IsNullOrWhiteSpace($MountPoint)) {
     try {
       $currentPath = (Get-Location).Path
       if ($currentPath -like "$MountPoint*") {

@@ -1,6 +1,8 @@
 # ShadowMountPlus (PS5)
 
-**Version:** `1.5beta2`
+**Version:** `1.5beta3`
+
+**Repository:** https://github.com/drakmor/shadowMountPlus
 
 
 **ShadowMountPlus** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMountPlus automatically detects, mounts, and installs game dumps from both **internal and external storage**.
@@ -21,7 +23,7 @@
 
 Notes:
 - Backend, read-only mode, and sector size can be configured via `/data/shadowmount/config.ini`.
-- Optional debug logging can be enabled via `debug=1` (writes to console and `/data/shadowmount/debug.log`).
+- Debug logging is enabled by default (`debug=1`) and writes to console plus `/data/shadowmount/debug.log` (set `debug=0` to disable).
 - **On 4.xx firmware, shutting down the console may not work correctly when using image files.**
 
 ## Recommended FS choice
@@ -34,23 +36,23 @@ Notes:
 This file is optional. If it does not exist, built-in defaults are used.
 
 Supported keys (all optional):
-- `debug=1|0` (`1` enables `log_debug` output to console + `/data/shadowmount/debug.log`; default is `0`)
-- `mount_read_only=1|0`
-- `exfat_backend=lvd|md`
-- `ufs_backend=lvd|md`
-- `scanpath=<absolute_path>` (can be repeated on multiple lines)
-- `exfat_sector_size=<value>`
-- `ufs_sector_size=<value>`
-- `pfs_sector_size=<value>`
-- `lvd_exfat_sector_size=<value>`
-- `lvd_ufs_sector_size=<value>`
-- `lvd_pfs_sector_size=<value>`
-- `md_exfat_sector_size=<value>`
-- `md_ufs_sector_size=<value>`
+- `debug=1|0` (`1` enables `log_debug` output to console + `/data/shadowmount/debug.log`; default is `1`)
+- `mount_read_only=1|0` (default: `1`)
+- `recursive_scan=1|0` (`0` = scan only first-level subfolders, `1` = recursive scan without depth limit; default: `0`)
+- `exfat_backend=lvd|md` (default: `lvd`)
+- `ufs_backend=lvd|md` (default: `lvd`)
+- `scanpath=<absolute_path>` (can be repeated on multiple lines; default: built-in scan path list below)
+- `lvd_exfat_sector_size=<value>` (default: `512`)
+- `lvd_ufs_sector_size=<value>` (default: `4096`)
+- `lvd_pfs_sector_size=<value>` (default: `32768`)
+- `md_exfat_sector_size=<value>` (default: `512`)
+- `md_ufs_sector_size=<value>` (default: `512`)
 
 Scan path behavior:
 - If at least one `scanpath=...` is present, only those custom paths are used.
 - `/data/ufsmnt` is always added automatically, even with custom paths.
+- With `recursive_scan=0` (default), only first-level subfolders are checked.
+- With `recursive_scan=1`, subfolders are scanned recursively.
 - Full scan loop runs every 10 seconds.
 
 Validation:
@@ -61,6 +63,12 @@ Validation:
 Image mountpoints are created under:
 
 `/data/ufsmnt/<image_name>-<fs_suffix>`
+
+Image layout requirement (`.ffpkg`, `.exfat`, `.ffpfs`):
+- Game files must be placed at the image root.
+- Do not add an extra top-level folder inside the image.
+- Valid example: `/sce_sys/param.json` exists directly from image root.
+- Invalid example: `/GAME_FOLDER/sce_sys/param.json` (extra nesting level).
 
 ## Scan paths
 
@@ -80,17 +88,32 @@ Default scan locations:
 
 You can override scan roots with `scanpath=...` entries in `/data/shadowmount/config.ini`.
 
+Recommended folder structure:
+- Default mode (`recursive_scan=0`):
+  - `/data/homebrew/<TITLE_ID>/`
+  - `/data/etaHEN/games/<TITLE_ID>/`
+   
+- Recursive mode (`recursive_scan=1`):
+  - `/data/homebrew/PS5/<AnyFolder>/<TITLE_ID>/`
+  - `/mnt/ext0/etaHEN/games/<Collection>/<TITLE_ID>/`
+
 
 ## Creating an exFAT image
 
 Linux (Ubuntu/Debian):
-- `sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync`
-- `truncate -s <image_size> test.exfat`
-- `mkfs.exfat -c 32768 test.exfat`
-- `mkdir -p /mnt/exfat`
-- `mount -t exfat-fuse -o loop test.exfat /mnt/exfat`
-- `rsync -r --info=progress2 APPXXXX/ /mnt/exfat/`
-- `umount /mnt/exfat`
+- Required components installation:
+  - `sudo apt-get update && sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync`
+- Script: `mkexfat.sh`
+- Usage: `./mkexfat.sh <game_root_dir> [output_file]`
+- Example:
+  - `chmod +x mkexfat.sh`
+  - `./mkexfat.sh ./APPXXXX ./PPSA12345.exfat`
+- Notes:
+  - Source folder must be the game root and contain `eboot.bin`.
+  - Auto-calculates image size using rounded file allocation + metadata + safety margin.
+  - Automatically selects exFAT cluster profile:
+  - Large-file profile: `64K`
+  - Small/mixed-file profile: `32K`
 
 Windows:
 - Recommended: use `make_image.bat` (wrapper for `New-OsfExfatImage.ps1` + OSFMount).
@@ -102,8 +125,8 @@ Windows:
   - `make_image.bat "C:\images\game.exfat" "C:\payload\APPXXXX"`
 - Behavior:
   - Auto-sizes the image to fit source content.
-  - Formats and copies the source folder into the image.
-  - Overwrites existing image file (uses `-ForceOverwrite`).
+  - Source folder must be the game root and contain `eboot.bin`.
+  - Formats and copies source folder contents into image root.
 - Optional (fixed size): run PowerShell script directly:
   - `powershell.exe -ExecutionPolicy Bypass -File .\New-OsfExfatImage.ps1 -ImagePath "C:\images\game.exfat" -SourceDir "C:\payload\APPXXXX" -Size 8G -ForceOverwrite`
 
@@ -111,14 +134,17 @@ Windows:
 
 FreeBSD:
 - Script: `mkufs2.sh`
-- Usage: `./mkufs2.sh <input_dir> [output_file]`
+- Usage: `./mkufs2.sh <game_root_dir> [output_file]`
 - Example:
   - `chmod +x mkufs2.sh`
   - `./mkufs2.sh ./APPXXXX ./PPSA12345.ffpkg`
 - Notes:
-  - The script auto-calculates image size (`source + 20% + 10MB` slack).
-  - Uses UFS2 format (`newfs -O 2`) with `-b 32768 -f 4096`.
-  - Requires BSD tools like `mdconfig`, `newfs`, `mount`, `umount`.
+  - Source folder must be the game root and contain `eboot.bin`.
+  - The script auto-calculates image size using rounded file allocation + metadata + safety margin.
+  - Recommended `newfs` parameters for UFS2:
+  - Large-file profile: `newfs -O 2 -b 65536 -f 4096 -m 0 -i 262144`
+  - Small/mixed-file profile: `newfs -O 2 -b 32768 -f 4096 -m 0 -i 262144`
+  - `mkufs2.sh` selects between these two profiles automatically (based on average file size).
 
 Windows:
 - You can create UFS2 images with **UFS2Tool** https://github.com/SvenGDK/UFS2Tool.
@@ -149,6 +175,29 @@ shadowmountplus.elf
 ```
 
 ---
+
+## Troubleshooting
+
+If a game is not mounted:
+- Debug log is enabled by default; if disabled, set `debug=1` in `/data/shadowmount/config.ini`.
+- Check `/data/shadowmount/debug.log` and system notifications from ShadowMount+.
+- Verify scan roots:
+  - if `scanpath=...` is set, only these paths are scanned;
+  - `/data/ufsmnt` is always scanned.
+- Verify scan depth:
+  - `recursive_scan=0` scans only first-level subfolders;
+  - `recursive_scan=1` scans recursively.
+- Verify game structure:
+  - folder game: `<GAME_DIR>/sce_sys/param.json`;
+  - image game (`.ffpkg` / `.exfat` / `.ffpfs`): `sce_sys/param.json` must be at image root (no extra top-level folder).
+- If you see `missing/invalid param.json` for an image, check via FTP that `/data/ufsmnt/<TITLE_ID>/` contains full game files and `sce_sys/param.json`.
+- If you see image mount failure, check image integrity and filesystem type (`.ffpkg`=UFS, `.exfat`=exFAT, `.ffpfs`=PFS).
+- If you see duplicate titleId notification, keep only one source per `<TITLE_ID>`.
+
+If a game is mounted but does not start:
+- Check registration notifications (`Register failed ...`).
+- If the game is not registered, try removing its launcher icon and removing it from Itemzflow.
+- If this does not help, remove the game data from system settings and retry (this will delete game saves).
 
 ## ⚠️ Notes
 * **First Run:** If you have a large library, the initial scan may take a few seconds to register all titles.

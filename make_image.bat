@@ -24,13 +24,15 @@ if not exist "%SRCDIR%" (
   exit /b 3
 )
 
+if not exist "%SRCDIR%\eboot.bin" (
+  echo [ERROR] eboot.bin not found in source directory: "%SRCDIR%"
+  exit /b 4
+)
+
 REM Run elevated? This BAT does not auto-elevate.
 REM Right-click -> Run as administrator, or start cmd as admin.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" ^
-  -ImagePath "%IMAGE%" ^
-  -SourceDir "%SRCDIR%" ^
-  -ForceOverwrite
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -ImagePath "%IMAGE%" -SourceDir "%SRCDIR%" -ForceOverwrite
 
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (

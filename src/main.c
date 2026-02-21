@@ -47,7 +47,7 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.5beta2"
+#define SHADOWMOUNT_VERSION "1.5beta3"
 #define UFS_MOUNT_BASE "/data/ufsmnt"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
@@ -222,6 +222,9 @@ bool is_installed(const char *title_id);
 bool is_data_mounted(const char *title_id);
 void notify_system(const char *fmt, ...);
 void log_debug(const char *fmt, ...);
+static void close_app_db(void);
+static void shutdown_ufs_mounts(void);
+static void shutdown_nullfs_mounts(void);
 
 // Standard Notification
 typedef struct notify_request {
@@ -291,6 +294,7 @@ struct TitleStateEntry {
   char title_id[MAX_TITLE_ID];
   uint8_t mount_reg_attempts;
   bool register_attempted_once;
+  bool duplicate_notified_once;
   bool valid;
 };
 struct TitleStateEntry g_title_state[TITLE_STATE_CAPACITY];
@@ -333,6 +337,7 @@ typedef enum {
 typedef struct {
   bool debug_enabled;
   bool mount_read_only;
+  bool recursive_scan;
   attach_backend_t exfat_backend;
   attach_backend_t ufs_backend;
   uint32_t lvd_sector_exfat;
@@ -682,6 +687,18 @@ static void mark_register_attempted(const char *title_id) {
     entry->register_attempted_once = true;
 }
 
+static void notify_duplicate_title_once(const char *title_id, const char *path_a,
+                                        const char *path_b) {
+  struct TitleStateEntry *entry = get_or_create_title_state(title_id);
+  if (!entry)
+    return;
+  if (entry->duplicate_notified_once)
+    return;
+  entry->duplicate_notified_once = true;
+  notify_system("Duplicate %s detected:\n%s\n%s", title_id, path_a,
+                path_b);
+}
+
 static bool is_missing_param_scan_limited(const char *path) {
   if (!is_under_ufs_mount_base(path))
     return false;
@@ -698,12 +715,16 @@ static void record_missing_param_failure(const char *path) {
   struct PathStateEntry *entry = get_or_create_path_state(path);
   if (!entry) {
     log_debug("  [SCAN] missing/invalid param.json: %s", path);
+    notify_system("Missing/invalid param.json:\n%s", path);
     return;
   }
   if (entry->missing_param_attempts < UINT8_MAX)
     entry->missing_param_attempts++;
 
   log_debug("  [SCAN] missing/invalid param.json: %s", path);
+  if (entry->missing_param_attempts == 1) {
+    notify_system("Missing/invalid param.json:\n%s", path);
+  }
   if (entry->missing_param_attempts >= MAX_MISSING_PARAM_SCAN_ATTEMPTS &&
       !entry->missing_param_limit_logged) {
     log_debug("  [SCAN] attempt limit reached (%u), skipping path: %s",
@@ -835,6 +856,7 @@ static void install_signal_handlers(void) {
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGHUP, &sa, NULL);
   sigaction(SIGQUIT, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
 }
 
 static bool should_stop_requested(void) {
@@ -844,7 +866,7 @@ static bool should_stop_requested(void) {
     remove(KILL_FILE);
     return true;
   }
-  return false;
+    return false;
 }
 
 static bool sleep_with_stop_check(unsigned int total_us) {
@@ -1000,65 +1022,125 @@ static bool ensure_app_db_open(void) {
   return true;
 }
 
-static bool ensure_app_db_stmt_has_title_ready(void) {
-  if (g_app_db_stmt_has_title)
-    return true;
+static bool app_db_wait_retry(int rc, int attempt, int max_attempts,
+                              bool close_before_retry) {
+  if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED)
+    return false;
+  if (attempt + 1 >= max_attempts || should_stop_requested())
+    return false;
+  if (close_before_retry)
+    close_app_db();
+  sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+  return true;
+}
 
-  const char *sql = "SELECT 1 FROM tbl_contentinfo WHERE titleId = ?1 LIMIT 1;";
-  for (int attempt = 0; attempt < APP_DB_PREPARE_BUSY_RETRIES; attempt++) {
+static int app_db_prepare_with_retry(const char *sql, sqlite3_stmt **stmt_out,
+                                     int max_attempts, const char *label) {
+  for (int attempt = 0; attempt < max_attempts; attempt++) {
     if (!ensure_app_db_open())
-      return false;
+      return -1;
 
-    int rc =
-        sqlite3_prepare_v2(g_app_db, sql, -1, &g_app_db_stmt_has_title, NULL);
+    int rc = sqlite3_prepare_v2(g_app_db, sql, -1, stmt_out, NULL);
     if (rc == SQLITE_OK)
-      return true;
+      return SQLITE_OK;
 
-    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-      if (attempt + 1 < APP_DB_PREPARE_BUSY_RETRIES && !should_stop_requested()) {
-        close_app_db();
-        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
-        continue;
-      }
-    }
+    if (app_db_wait_retry(rc, attempt, max_attempts, true))
+      continue;
 
-    log_debug("  [DB] prepare failed for titleId check: rc=%d err=%s", rc,
+    log_debug("  [DB] prepare failed for %s: rc=%d err=%s", label, rc,
               (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
     close_app_db();
-    return false;
+    return rc;
   }
 
   close_app_db();
-  return false;
+  return -1;
 }
 
-static bool ensure_app_db_stmt_update_snd0_ready(void) {
-  if (g_app_db_stmt_update_snd0)
-    return true;
+static bool init_app_triggers(void) {
+  static const char *find_sql =
+      "SELECT substr(name, 14) FROM sqlite_master "
+      "WHERE type='table' "
+      "AND name GLOB 'tbl_iconinfo_[0-9]*' "
+      "LIMIT 1;";
 
-  const char *sql =
-      "UPDATE tbl_contentinfo "
-      "SET snd0info = '/user/appmeta/' || ?1 || '/snd0.at9' "
-      "WHERE titleId = ?1;";
-  for (int attempt = 0; attempt < APP_DB_PREPARE_BUSY_RETRIES; attempt++) {
+  for (int attempt = 0; attempt < APP_DB_UPDATE_BUSY_RETRIES; attempt++) {
     if (!ensure_app_db_open())
       return false;
 
-    int rc =
-        sqlite3_prepare_v2(g_app_db, sql, -1, &g_app_db_stmt_update_snd0, NULL);
-    if (rc == SQLITE_OK)
-      return true;
+    char suffix[21];
+    suffix[0] = '\0';
 
-    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-      if (attempt + 1 < APP_DB_PREPARE_BUSY_RETRIES && !should_stop_requested()) {
-        close_app_db();
-        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
-        continue;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(g_app_db, find_sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+      int step_rc = sqlite3_step(stmt);
+      if (step_rc == SQLITE_ROW) {
+        const char *val = (const char *)sqlite3_column_text(stmt, 0);
+        if (val)
+          (void)strlcpy(suffix, val, sizeof(suffix));
+        rc = SQLITE_OK;
+      } else {
+        rc = step_rc;
       }
     }
+    if (stmt)
+      sqlite3_finalize(stmt);
 
-    log_debug("  [DB] prepare failed for snd0info update: rc=%d err=%s", rc,
-              (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+    if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+      log_debug("  [DB] query tbl_iconinfo failed: rc=%d err=%s", rc,
+                (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+      if (app_db_wait_retry(rc, attempt, APP_DB_UPDATE_BUSY_RETRIES, true))
+        continue;
+      close_app_db();
+      return false;
+    }
+
+    if (suffix[0] == '\0') {
+      log_debug("  [DB] no tbl_iconinfo table found, skipping triggers");
+      close_app_db();
+      return true;
+    }
+
+    char table_name[34];
+    snprintf(table_name, sizeof(table_name), "tbl_iconinfo_%s", suffix);
+
+    char sql[2048];
+    snprintf(sql, sizeof(sql),
+             "CREATE TRIGGER IF NOT EXISTS trig_update_drm_tbl_iconinfo_%s "
+             "AFTER UPDATE OF appDrmType ON %s "
+             "WHEN new.appDrmType = 1 "
+             "BEGIN "
+             "UPDATE %s SET appDrmType = 5 WHERE titleId = old.titleId; "
+             "END;"
+             "CREATE TRIGGER IF NOT EXISTS trig_insert_drm_tbl_iconinfo_%s "
+             "AFTER INSERT ON %s "
+             "WHEN new.appDrmType = 1 "
+             "BEGIN "
+             "UPDATE %s SET appDrmType = 5 WHERE titleId = new.titleId; "
+             "END;"
+             "UPDATE %s SET appDrmType=5 WHERE appDrmType=1;",
+             suffix, table_name, table_name, suffix, table_name, table_name,
+             table_name);
+
+    char *err = NULL;
+    rc = sqlite3_exec(g_app_db, sql, NULL, NULL, &err);
+    if (rc == SQLITE_OK) {
+      int changes = sqlite3_changes(g_app_db);
+      log_debug("  [DB] triggers updated for %s, fixed rows=%d",
+                table_name, changes);
+      close_app_db();
+      return true;
+    }
+
+    log_debug("  [DB] update triggers failed: rc=%d err=%s", rc,
+              err ? err : (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+    if (err)
+      sqlite3_free(err);
+
+    if (app_db_wait_retry(rc, attempt, APP_DB_UPDATE_BUSY_RETRIES, true))
+      continue;
+
     close_app_db();
     return false;
   }
@@ -1071,10 +1153,17 @@ static int query_title_registered_in_app_db(const char *title_id) {
   if (!title_id || title_id[0] == '\0')
     return 0;
 
-  for (int attempt = 0; attempt < APP_DB_QUERY_BUSY_RETRIES; attempt++) {
-    if (!ensure_app_db_stmt_has_title_ready())
+  if (!g_app_db_stmt_has_title) {
+    const char *sql =
+        "SELECT 1 FROM tbl_contentinfo WHERE titleId = ?1 LIMIT 1;";
+    int prep_rc = app_db_prepare_with_retry(sql, &g_app_db_stmt_has_title,
+                                            APP_DB_PREPARE_BUSY_RETRIES,
+                                            "titleId check");
+    if (prep_rc != SQLITE_OK)
       return -1;
+  }
 
+  for (int attempt = 0; attempt < APP_DB_QUERY_BUSY_RETRIES; attempt++) {
     sqlite3_reset(g_app_db_stmt_has_title);
     sqlite3_clear_bindings(g_app_db_stmt_has_title);
     if (sqlite3_bind_text(g_app_db_stmt_has_title, 1, title_id, -1,
@@ -1094,12 +1183,8 @@ static int query_title_registered_in_app_db(const char *title_id) {
       return ret;
     }
 
-    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-      if (attempt + 1 < APP_DB_QUERY_BUSY_RETRIES && !should_stop_requested()) {
-        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
-        continue;
-      }
-    }
+    if (app_db_wait_retry(rc, attempt, APP_DB_QUERY_BUSY_RETRIES, false))
+      continue;
 
     if (g_app_db) {
       log_debug("  [DB] step failed for titleId check: rc=%d err=%s", rc,
@@ -1116,8 +1201,18 @@ static int query_title_registered_in_app_db(const char *title_id) {
 static int update_snd0info(const char *title_id) {
   if (!title_id || title_id[0] == '\0')
     return -1;
-  if (!ensure_app_db_stmt_update_snd0_ready())
-    return -1;
+
+  if (!g_app_db_stmt_update_snd0) {
+    const char *sql =
+        "UPDATE tbl_contentinfo "
+        "SET snd0info = '/user/appmeta/' || ?1 || '/snd0.at9' "
+        "WHERE titleId = ?1;";
+    int prep_rc = app_db_prepare_with_retry(sql, &g_app_db_stmt_update_snd0,
+                                            APP_DB_PREPARE_BUSY_RETRIES,
+                                            "snd0info update");
+    if (prep_rc != SQLITE_OK)
+      return -1;
+  }
 
   for (int attempt = 0; attempt < APP_DB_UPDATE_BUSY_RETRIES; attempt++) {
     sqlite3_reset(g_app_db_stmt_update_snd0);
@@ -1139,12 +1234,8 @@ static int update_snd0info(const char *title_id) {
       return changes;
     }
 
-    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-      if (attempt + 1 < APP_DB_UPDATE_BUSY_RETRIES && !should_stop_requested()) {
-        sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
-        continue;
-      }
-    }
+    if (app_db_wait_retry(rc, attempt, APP_DB_UPDATE_BUSY_RETRIES, false))
+      continue;
 
     if (g_app_db) {
       log_debug("  [DB] step failed for snd0info update: rc=%d err=%s", rc,
@@ -1218,6 +1309,8 @@ bool wait_for_stability_fast(const char *path, const char *name) {
 }
 
 // --- Mount/Copy Helpers for Install Action ---
+static int copy_file(const char *src, const char *dst);
+
 static int remount_system_ex(void) {
   struct iovec iov[] = {
       IOVEC_ENTRY("from"),      IOVEC_ENTRY("/dev/ssd0.system_ex"),
@@ -1300,38 +1393,8 @@ static int copy_dir(const char *src, const char *dst) {
         ret = -1;
         break;
       }
-    }
-    else {
-      FILE *fs = fopen(ss, "rb");
-      if (!fs) {
-        ret = -1;
-        break;
-      }
-      FILE *fd = fopen(dd, "wb");
-      if (!fd) {
-        fclose(fs);
-        ret = -1;
-        break;
-      }
-      char buf[8192];
-      bool copy_ok = true;
-      while (copy_ok) {
-        size_t n = fread(buf, 1, sizeof(buf), fs);
-        if (n > 0 && fwrite(buf, 1, n, fd) != n)
-          copy_ok = false;
-        if (n < sizeof(buf)) {
-          if (ferror(fs))
-            copy_ok = false;
-          break;
-        }
-      }
-      if (fflush(fd) != 0)
-        copy_ok = false;
-      if (fclose(fd) != 0)
-        copy_ok = false;
-      if (fclose(fs) != 0)
-        copy_ok = false;
-      if (!copy_ok) {
+    } else {
+      if (copy_file(ss, dd) != 0) {
         ret = -1;
         break;
       }
@@ -1342,7 +1405,69 @@ static int copy_dir(const char *src, const char *dst) {
   return ret;
 }
 
-int copy_file(const char *src, const char *dst) {
+static int copy_param_json_rewrite(const char *src, const char *dst) {
+  FILE *fs = fopen(src, "rb");
+  if (!fs)
+    return -1;
+
+  if (fseek(fs, 0, SEEK_END) != 0) {
+    fclose(fs);
+    return -1;
+  }
+  long file_size = ftell(fs);
+  if (file_size < 0) {
+    fclose(fs);
+    return -1;
+  }
+  rewind(fs);
+
+  size_t len = (size_t)file_size;
+  char *buf = (char *)malloc(len + 1);
+  if (!buf) {
+    fclose(fs);
+    return -1;
+  }
+  if (len > 0 && fread(buf, 1, len, fs) != len) {
+    free(buf);
+    fclose(fs);
+    return -1;
+  }
+  fclose(fs);
+  buf[len] = '\0';
+
+  char *hit = strstr(buf, "upgradable");
+  if (hit) {
+    size_t offset = (size_t)(hit - buf);
+    size_t tail = len - offset - 10u;
+    memcpy(hit, "standard", 8u);
+    memmove(hit + 8u, hit + 10u, tail + 1u);
+    len -= 2u;
+  }
+
+  FILE *fd = fopen(dst, "wb");
+  if (!fd) {
+    free(buf);
+    return -1;
+  }
+
+  int ret = 0;
+  if (len > 0 && fwrite(buf, 1, len, fd) != len)
+    ret = -1;
+  if (fclose(fd) != 0)
+    ret = -1;
+
+  if (ret == 0 && hit)
+    log_debug("  [COPY] param.json patched: %s", dst);
+
+  free(buf);
+  return ret;
+}
+
+static int copy_file(const char *src, const char *dst) {
+  if (strstr(src, "/sce_sys/param.json")) {
+    return copy_param_json_rewrite(src, dst);
+  }
+
   char buf[8192];
   FILE *fs = fopen(src, "rb");
   if (!fs)
@@ -1386,18 +1511,6 @@ static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   return false;
 }
 
-static bool wait_for_lvd_node_state(int unit_id, bool should_exist) {
-  char devname[64];
-  snprintf(devname, sizeof(devname), "/dev/lvd%d", unit_id);
-  return wait_for_dev_node_state(devname, should_exist);
-}
-
-static bool wait_for_md_node_state(int unit_id, bool should_exist) {
-  char devname[64];
-  snprintf(devname, sizeof(devname), "/dev/md%d", unit_id);
-  return wait_for_dev_node_state(devname, should_exist);
-}
-
 static bool is_source_stable_for_mount(const char *path, const char *name,
                                        const char *tag) {
   struct stat st;
@@ -1414,8 +1527,9 @@ static bool is_source_stable_for_mount(const char *path, const char *name,
 
 // --- Runtime Config Parsing ---
 static void init_runtime_config_defaults(void) {
-  g_runtime_cfg.debug_enabled = false;
+  g_runtime_cfg.debug_enabled = true;
   g_runtime_cfg.mount_read_only = (IMAGE_MOUNT_READ_ONLY != 0);
+  g_runtime_cfg.recursive_scan = false;
   g_runtime_cfg.exfat_backend = DEFAULT_EXFAT_BACKEND;
   g_runtime_cfg.ufs_backend = DEFAULT_UFS_BACKEND;
   g_runtime_cfg.lvd_sector_exfat = LVD_SECTOR_SIZE_EXFAT;
@@ -1565,6 +1679,15 @@ static bool load_runtime_config(void) {
       continue;
     }
 
+    if (strcasecmp(key, "recursive_scan") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      g_runtime_cfg.recursive_scan = bval;
+      continue;
+    }
+
     if (strcasecmp(key, "exfat_backend") == 0) {
       if (!parse_backend_ini(value, &backend)) {
         log_debug("  [CFG] invalid backend at line %d: %s=%s", line_no, key,
@@ -1598,9 +1721,6 @@ static bool load_runtime_config(void) {
     }
 
     bool is_sector_key =
-        (strcasecmp(key, "exfat_sector_size") == 0) ||
-        (strcasecmp(key, "ufs_sector_size") == 0) ||
-        (strcasecmp(key, "pfs_sector_size") == 0) ||
         (strcasecmp(key, "lvd_exfat_sector_size") == 0) ||
         (strcasecmp(key, "lvd_ufs_sector_size") == 0) ||
         (strcasecmp(key, "lvd_pfs_sector_size") == 0) ||
@@ -1617,15 +1737,7 @@ static bool load_runtime_config(void) {
       continue;
     }
 
-    if (strcasecmp(key, "exfat_sector_size") == 0) {
-      g_runtime_cfg.lvd_sector_exfat = u32;
-      g_runtime_cfg.md_sector_exfat = u32;
-    } else if (strcasecmp(key, "ufs_sector_size") == 0) {
-      g_runtime_cfg.lvd_sector_ufs = u32;
-      g_runtime_cfg.md_sector_ufs = u32;
-    } else if (strcasecmp(key, "pfs_sector_size") == 0) {
-      g_runtime_cfg.lvd_sector_pfs = u32;
-    } else if (strcasecmp(key, "lvd_exfat_sector_size") == 0) {
+    if (strcasecmp(key, "lvd_exfat_sector_size") == 0) {
       g_runtime_cfg.lvd_sector_exfat = u32;
     } else if (strcasecmp(key, "lvd_ufs_sector_size") == 0) {
       g_runtime_cfg.lvd_sector_ufs = u32;
@@ -1648,11 +1760,13 @@ static bool load_runtime_config(void) {
     (void)add_runtime_scan_path(UFS_MOUNT_BASE);
   }
 
-  log_debug("  [CFG] loaded: debug=%d ro=%d exfat_backend=%s ufs_backend=%s "
+  log_debug("  [CFG] loaded: debug=%d ro=%d recursive_scan=%d "
+            "exfat_backend=%s ufs_backend=%s "
             "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u) "
             "scan_paths=%d",
             g_runtime_cfg.debug_enabled ? 1 : 0,
             g_runtime_cfg.mount_read_only ? 1 : 0,
+            g_runtime_cfg.recursive_scan ? 1 : 0,
             backend_name(g_runtime_cfg.exfat_backend),
             backend_name(g_runtime_cfg.ufs_backend),
             g_runtime_cfg.lvd_sector_exfat, g_runtime_cfg.lvd_sector_ufs,
@@ -1802,7 +1916,9 @@ static bool detach_lvd_unit(int unit_id) {
   }
   close(fd);
 
-  if (!wait_for_lvd_node_state(unit_id, false)) {
+  char devname[64];
+  snprintf(devname, sizeof(devname), "/dev/lvd%d", unit_id);
+  if (!wait_for_dev_node_state(devname, false)) {
     log_debug("  [IMG][%s] device node still present after detach: /dev/lvd%d",
               backend_name(ATTACH_BACKEND_LVD), unit_id);
     ok = false;
@@ -1841,7 +1957,9 @@ static bool detach_md_unit(int unit_id) {
   }
   close(fd);
 
-  if (!wait_for_md_node_state(unit_id, false)) {
+  char devname[64];
+  snprintf(devname, sizeof(devname), "/dev/md%d", unit_id);
+  if (!wait_for_dev_node_state(devname, false)) {
     log_debug("  [IMG][%s] device node still present after detach: /dev/md%d",
               backend_name(ATTACH_BACKEND_MD), unit_id);
     ok = false;
@@ -1895,6 +2013,43 @@ static const char *backend_name(attach_backend_t backend) {
   }
 }
 
+static void log_fs_stats(const char *tag, const char *path,
+                         const char *type_hint) {
+  struct statfs sfs;
+  if (statfs(path, &sfs) != 0) {
+    log_debug("  [%s] FS stats read failed for %s: %s", tag, path,
+              strerror(errno));
+    return;
+  }
+
+  const char *type_name = type_hint;
+  if (sfs.f_fstypename[0] != '\0')
+    type_name = sfs.f_fstypename;
+  if (!type_name)
+    type_name = "unknown";
+
+  uint64_t bsize = (uint64_t)sfs.f_bsize;
+  uint64_t iosize = (uint64_t)sfs.f_iosize;
+  uint64_t blocks = (uint64_t)sfs.f_blocks;
+  uint64_t bfree = (uint64_t)sfs.f_bfree;
+  uint64_t bavail = (uint64_t)sfs.f_bavail;
+  uint64_t files = (uint64_t)sfs.f_files;
+  uint64_t ffree = (uint64_t)sfs.f_ffree;
+  uint64_t total_bytes = blocks * bsize;
+  uint64_t free_bytes = bfree * bsize;
+  uint64_t avail_bytes = bavail * bsize;
+
+  log_debug("  [%s] FS stats: path=%s type=%s bsize=%llu iosize=%llu "
+            "blocks=%llu bfree=%llu bavail=%llu files=%llu ffree=%llu "
+            "flags=0x%lX total=%lluB free=%lluB avail=%lluB",
+            tag, path, type_name, (unsigned long long)bsize,
+            (unsigned long long)iosize, (unsigned long long)blocks,
+            (unsigned long long)bfree, (unsigned long long)bavail,
+            (unsigned long long)files, (unsigned long long)ffree,
+            (unsigned long)sfs.f_flags, (unsigned long long)total_bytes,
+            (unsigned long long)free_bytes, (unsigned long long)avail_bytes);
+}
+
 static void strip_extension(const char *filename, char *out, size_t out_size) {
   const char *dot = strrchr(filename, '.');
   size_t len = dot ? (size_t)(dot - filename) : strlen(filename);
@@ -1904,27 +2059,21 @@ static void strip_extension(const char *filename, char *out, size_t out_size) {
   out[len] = '\0';
 }
 
-static const char *mount_fs_suffix(image_fs_type_t fs_type) {
-  switch (fs_type) {
-  case IMAGE_FS_UFS:
-    return "ufs";
-  case IMAGE_FS_EXFAT:
-    return "exfat";
-  case IMAGE_FS_PFS:
-    return "pfs";
-  default:
-    return "unknown";
-  }
-}
-
 static void build_ufs_mount_point(const char *file_path, image_fs_type_t fs_type,
                                   char *mount_point, size_t mount_point_size) {
   const char *filename = strrchr(file_path, '/');
   filename = filename ? filename + 1 : file_path;
   char mount_name[MAX_PATH];
   strip_extension(filename, mount_name, sizeof(mount_name));
+  const char *suffix = "unknown";
+  if (fs_type == IMAGE_FS_UFS)
+    suffix = "ufs";
+  else if (fs_type == IMAGE_FS_EXFAT)
+    suffix = "exfat";
+  else if (fs_type == IMAGE_FS_PFS)
+    suffix = "pfs";
   snprintf(mount_point, mount_point_size, "%s/%s-%s", UFS_MOUNT_BASE,
-           mount_name, mount_fs_suffix(fs_type));
+           mount_name, suffix);
 }
 
 static bool unmount_ufs_image(const char *file_path, int unit_id,
@@ -2099,14 +2248,14 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
       return false;
     }
 
-    if (!wait_for_md_node_state(unit_id, true)) {
-      log_debug("  [IMG][%s] device node did not appear: /dev/md%d",
-                backend_name(attach_backend), unit_id);
+    snprintf(devname, sizeof(devname), "/dev/md%d", unit_id);
+    if (!wait_for_dev_node_state(devname, true)) {
+      log_debug("  [IMG][%s] device node did not appear: %s",
+                backend_name(attach_backend), devname);
       detach_md_unit(unit_id);
       return false;
     }
 
-    snprintf(devname, sizeof(devname), "/dev/md%d", unit_id);
     log_debug("  [IMG][%s] attach returned unit=%d",
               backend_name(attach_backend), unit_id);
   } else {
@@ -2180,14 +2329,13 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
     log_debug("  [IMG][%s] attach returned unit=%d",
               backend_name(attach_backend), unit_id);
 
-    if (!wait_for_lvd_node_state(unit_id, true)) {
-      log_debug("  [IMG][%s] device node did not appear: /dev/lvd%d",
-                backend_name(attach_backend), unit_id);
+    snprintf(devname, sizeof(devname), "/dev/lvd%d", unit_id);
+    if (!wait_for_dev_node_state(devname, true)) {
+      log_debug("  [IMG][%s] device node did not appear: %s",
+                backend_name(attach_backend), devname);
       detach_lvd_unit(unit_id);
       return false;
     }
-
-    snprintf(devname, sizeof(devname), "/dev/lvd%d", unit_id);
   }
 
   log_debug("  [IMG][%s] Attached as %s", backend_name(attach_backend), devname);
@@ -2203,19 +2351,25 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
   const char *ekpfs_key = PFS_ZERO_EKPFS_KEY_HEX;
 
   struct iovec iov_ufs[] = {
-      IOVEC_ENTRY("fstype"), IOVEC_ENTRY("ufs"), IOVEC_ENTRY("from"),
-      IOVEC_ENTRY(devname),  IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point),
-      IOVEC_ENTRY("budgetid"), IOVEC_ENTRY("game"),
+      IOVEC_ENTRY("fstype"),    IOVEC_ENTRY("ufs"), IOVEC_ENTRY("from"),
+      IOVEC_ENTRY(devname),     IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point),
+      IOVEC_ENTRY("budgetid"),  IOVEC_ENTRY(DEVPFS_BUDGET_GAME),
+      IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("errmsg"), {(void *)mount_errmsg, sizeof(mount_errmsg)}};
 
   struct iovec iov_exfat[] = {
       IOVEC_ENTRY("from"),      IOVEC_ENTRY(devname),
       IOVEC_ENTRY("fspath"),    IOVEC_ENTRY(mount_point),
       IOVEC_ENTRY("fstype"),    IOVEC_ENTRY("exfatfs"),
+      IOVEC_ENTRY("budgetid"),  IOVEC_ENTRY(DEVPFS_BUDGET_GAME),
       IOVEC_ENTRY("large"),     IOVEC_ENTRY("yes"),
       IOVEC_ENTRY("timezone"),  IOVEC_ENTRY("static"),
       IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("ignoreacl"), IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
 
   struct iovec iov_pfs[] = {
@@ -2228,6 +2382,9 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
       IOVEC_ENTRY("playgo"),    IOVEC_ENTRY(playgo),
       IOVEC_ENTRY("disc"),      IOVEC_ENTRY(disc),
       IOVEC_ENTRY("ekpfs"),     IOVEC_ENTRY(ekpfs_key),
+      IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
 
   if (fs_type == IMAGE_FS_UFS) {
@@ -2263,11 +2420,13 @@ static bool mount_ufs_image(const char *file_path, image_fs_type_t fs_type) {
     log_debug("  [IMG][%s] nmount %s failed: %s",
               backend_name(attach_backend), mount_mode, strerror(mount_errno));
     detach_attached_unit(attach_backend, unit_id);
+    errno = mount_errno;
     return false;
   }
 
   log_debug("  [IMG][%s] Mounted (%s) %s -> %s", backend_name(attach_backend),
             image_fs_name(fs_type), devname, mount_point);
+  log_fs_stats("IMG", mount_point, image_fs_name(fs_type));
 
   // Cache it
   cache_ufs_mount(file_path, unit_id, attach_backend);
@@ -2294,6 +2453,49 @@ static void cleanup_stale_image_mounts(void) {
   }
 }
 
+static void cleanup_mount_dirs(void) {
+  DIR *d = opendir(UFS_MOUNT_BASE);
+  if (!d) {
+    if (errno != ENOENT)
+      log_debug("  [IMG] open %s failed: %s", UFS_MOUNT_BASE, strerror(errno));
+    return;
+  }
+
+  struct dirent *entry;
+  while ((entry = readdir(d)) != NULL) {
+    if (should_stop_requested())
+      break;
+    if (entry->d_name[0] == '.')
+      continue;
+
+    char full_path[MAX_PATH];
+    snprintf(full_path, sizeof(full_path), "%s/%s", UFS_MOUNT_BASE, entry->d_name);
+
+    bool is_dir = false;
+    if (entry->d_type == DT_DIR) {
+      is_dir = true;
+    } else if (entry->d_type == DT_UNKNOWN) {
+      struct stat st;
+      if (stat(full_path, &st) == 0)
+        is_dir = S_ISDIR(st.st_mode);
+    }
+    if (!is_dir)
+      continue;
+
+    if (rmdir(full_path) == 0) {
+      log_debug("  [IMG] removed empty mount dir: %s", full_path);
+      continue;
+    }
+
+    if (errno == ENOTEMPTY || errno == EBUSY || errno == ENOENT)
+      continue;
+    log_debug("  [IMG] failed to remove mount dir %s: %s", full_path,
+              strerror(errno));
+  }
+
+  closedir(d);
+}
+
 static void maybe_mount_image_file(const char *full_path,
                                    const char *display_name) {
   image_fs_type_t fs_type = detect_image_fs_type(display_name);
@@ -2305,8 +2507,14 @@ static void maybe_mount_image_file(const char *full_path,
     return;
   if (mount_ufs_image(full_path, fs_type))
     clear_image_mount_attempts(full_path);
-  else
-    bump_image_mount_attempts(full_path);
+  else {
+    int mount_err = errno;
+    uint8_t attempts = bump_image_mount_attempts(full_path);
+    if (attempts == 1) {
+      notify_system("Image mount failed: 0x%08X\n%s",
+                    (uint32_t)mount_err, full_path);
+    }
+  }
 }
 
 static void shutdown_ufs_mounts(void) {
@@ -2458,6 +2666,16 @@ static void prune_game_cache(void) {
       continue;
     if (access(cache[k].path, F_OK) == 0)
       continue;
+
+    if (cache[k].title_id[0] != '\0') {
+      char mount_point[MAX_PATH];
+      build_system_ex_app_path(cache[k].title_id, mount_point, sizeof(mount_point));
+      if (unmount_nullfs_mount(mount_point)) {
+        log_debug("  [MOUNT] source removed, unmounted: %s (%s)",
+                  cache[k].title_id, cache[k].path);
+      }
+    }
+
     cache[k].valid = false;
     cache[k].path[0] = '\0';
     cache[k].title_id[0] = '\0';
@@ -2564,6 +2782,7 @@ static bool try_collect_candidate_for_directory(
     if (strcmp(candidates[i].title_id, title_id) == 0) {
       log_debug("  [SKIP] title already queued in this cycle: %s (%s)", title_name,
                 title_id);
+      notify_duplicate_title_once(title_id, full_path, candidates[i].path);
       return true;
     }
   }
@@ -2585,6 +2804,10 @@ static bool try_collect_candidate_for_directory(
           (title_id[0] != '\0' && strcmp(cache[k].title_id, title_id) == 0)) {
         log_debug("  [SKIP] already cached in this session: %s (%s) path=%s",
                   title_name, title_id, full_path);
+        if (title_id[0] != '\0' && strcmp(cache[k].title_id, title_id) == 0 &&
+            strcmp(cache[k].path, full_path) != 0) {
+          notify_duplicate_title_once(title_id, full_path, cache[k].path);
+        }
         return true;
       }
     }
@@ -2635,7 +2858,66 @@ static bool try_collect_candidate_for_directory(
   return true;
 }
 
+static void collect_candidates_recursively(
+    const char *dir_path, scan_candidate_t *candidates, int max_candidates,
+    int *candidate_count, struct AppDbLookupCache *db_cache,
+    int *db_cache_count, char discovered_param_roots[][MAX_PATH],
+    int *discovered_param_root_count) {
+  if (should_stop_requested() || !dir_path || dir_path[0] == '\0')
+    return;
+
+  // Once a directory has sce_sys/param.json (valid or not),
+  // it is treated as a terminal game root and descendants are skipped.
+  if (try_collect_candidate_for_directory(
+          dir_path, candidates, max_candidates, candidate_count, db_cache,
+          db_cache_count, discovered_param_roots, discovered_param_root_count)) {
+    return;
+  }
+
+  DIR *d = opendir(dir_path);
+  if (!d)
+    return;
+
+  struct dirent *entry;
+  while ((entry = readdir(d)) != NULL) {
+    if (should_stop_requested())
+      break;
+    if (entry->d_name[0] == '.')
+      continue;
+
+    char full_path[MAX_PATH];
+    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+
+    bool is_dir = false;
+    if (entry->d_type == DT_DIR) {
+      is_dir = true;
+    } else if (entry->d_type == DT_UNKNOWN) {
+      struct stat st;
+      if (stat(full_path, &st) == 0)
+        is_dir = S_ISDIR(st.st_mode);
+    }
+
+    if (!is_dir)
+      continue;
+
+    collect_candidates_recursively(
+        full_path, candidates, max_candidates, candidate_count, db_cache,
+        db_cache_count, discovered_param_roots, discovered_param_root_count);
+  }
+
+  closedir(d);
+}
+
 // --- Unified Scan Pass (images + game candidates) ---
+static void cleanup_lost_sources_before_scan(void) {
+  // 1) Remove stale nullfs mounts for deleted game sources.
+  prune_game_cache();
+  // 2) After nullfs cleanup, stale image unmounts are less likely to be busy.
+  cleanup_stale_image_mounts();
+  // 3) Drop stale path-state entries.
+  prune_path_state();
+}
+
 static int collect_scan_candidates(scan_candidate_t *candidates,
                                    int max_candidates) {
   int candidate_count = 0;
@@ -2646,10 +2928,6 @@ static int collect_scan_candidates(scan_candidate_t *candidates,
   memset(db_cache, 0, sizeof(g_scan_db_lookup_cache));
   memset(discovered_param_roots, 0, sizeof(g_scan_discovered_param_roots));
 
-  cleanup_stale_image_mounts();
-  prune_path_state();
-  prune_game_cache();
-
   for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
     if (should_stop_requested())
       goto done;
@@ -2658,24 +2936,6 @@ static int collect_scan_candidates(scan_candidate_t *candidates,
     DIR *d = opendir(SCAN_PATHS[i]);
     if (!d)
       continue;
-
-    if (is_under_discovered_param_root(SCAN_PATHS[i], discovered_param_roots,
-                                       discovered_param_root_count)) {
-      log_debug("  [SKIP] scan root under discovered game root: %s",
-                SCAN_PATHS[i]);
-      closedir(d);
-      continue;
-    }
-
-    // Check the scan root itself first. If it already has sce_sys/param.json
-    // (or belongs to an already discovered game root), skip scanning children.
-    if (try_collect_candidate_for_directory(
-            SCAN_PATHS[i], candidates, max_candidates, &candidate_count, db_cache,
-            &db_cache_count, discovered_param_roots,
-            &discovered_param_root_count)) {
-      closedir(d);
-      continue;
-    }
 
     struct dirent *entry;
     while ((entry = readdir(d)) != NULL) {
@@ -2709,10 +2969,17 @@ static int collect_scan_candidates(scan_candidate_t *candidates,
       if (!is_dir)
         continue;
 
-      (void)try_collect_candidate_for_directory(
-          full_path, candidates, max_candidates, &candidate_count, db_cache,
-          &db_cache_count, discovered_param_roots,
-          &discovered_param_root_count);
+      if (g_runtime_cfg.recursive_scan) {
+        collect_candidates_recursively(
+            full_path, candidates, max_candidates, &candidate_count, db_cache,
+            &db_cache_count, discovered_param_roots,
+            &discovered_param_root_count);
+      } else {
+        (void)try_collect_candidate_for_directory(
+            full_path, candidates, max_candidates, &candidate_count, db_cache,
+            &db_cache_count, discovered_param_roots,
+            &discovered_param_root_count);
+      }
     }
     closedir(d);
   }
@@ -2810,6 +3077,10 @@ bool mount_and_install(const char *src_path, const char *title_id,
   }
 
   // REGISTER
+  char src_snd0[MAX_PATH];
+  snprintf(src_snd0, sizeof(src_snd0), "%s/sce_sys/snd0.at9", src_path);
+  bool has_src_snd0 = (access(src_snd0, F_OK) == 0);
+
   mark_register_attempted(title_id);
   int res = sceAppInstUtilAppInstallTitleDir(title_id, "/user/app/", 0);
   sceKernelUsleep(200000);
@@ -2817,17 +3088,23 @@ bool mount_and_install(const char *src_path, const char *title_id,
   if (res == 0) {
     log_debug("  [REG] Installed NEW!");
     trigger_rich_toast(title_id, title_name, "Installed");
-    int snd0_updates = update_snd0info(title_id);
-    if (snd0_updates >= 0)
-      log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
+    if (has_src_snd0) {
+      int snd0_updates = update_snd0info(title_id);
+      if (snd0_updates >= 0)
+        log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
+    }
   } else if ((uint32_t)res == 0x80990002u) {
     log_debug("  [REG] Restored.");
-    int snd0_updates = update_snd0info(title_id);
-    if (snd0_updates >= 0)
-      log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
+    if (has_src_snd0) {
+      int snd0_updates = update_snd0info(title_id);
+      if (snd0_updates >= 0)
+        log_debug("  [DB] snd0info updated rows=%d", snd0_updates);
+    } 
     // Silent on restore/remount to avoid spam
   } else {
     log_debug("  [REG] FAIL: 0x%x", res);
+    notify_system("Register failed: %s (%s)\ncode=0x%08X", title_name, title_id,
+                  (uint32_t)res);
     if (nullfs_mounted)
       unmount_nullfs_mount(system_ex_app);
     return false;
@@ -2876,6 +3153,7 @@ static void process_scan_candidates(const scan_candidate_t *candidates,
 
 // --- Scan Orchestration ---
 static int scan_all_paths_once(bool execute_actions) {
+  cleanup_lost_sources_before_scan();
   int candidate_count = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
   if (execute_actions && candidate_count > 0)
     process_scan_candidates(g_scan_candidates, candidate_count);
@@ -2918,21 +3196,48 @@ int main(void) {
 
   remove(LOG_FILE);
 
+  log_debug("SHADOWMOUNT+ v%s START exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
+  notify_system("ShadowMount+ v%s exFAT/UFS",
+                  SHADOWMOUNT_VERSION);
+
   load_runtime_config();
 
-  log_debug("SHADOWMOUNT+ v%s START exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
+  for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
+    DIR *d = opendir(SCAN_PATHS[i]);
+    if (!d)
+      continue;
+
+    bool non_empty = false;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+      if ((entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
+          (entry->d_name[0] == '.' && entry->d_name[1] == '.' &&
+           entry->d_name[2] == '\0')) {
+        continue;
+      }
+      non_empty = true;
+      break;
+    }
+    closedir(d);
+
+    if (non_empty)
+      log_fs_stats("SCAN", SCAN_PATHS[i], NULL);
+  }
+  
+  if (g_runtime_cfg.recursive_scan)
+    notify_system("ShadowMount+: Recursive scan enabled.");
+
+  cleanup_mount_dirs();
+  (void)init_app_triggers();
 
   // --- STARTUP LOGIC ---
+  cleanup_lost_sources_before_scan();
   int new_games = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
 
-  if (new_games == 0) {
-    // SCENARIO A: Nothing to do.
-    notify_system("ShadowMount+ v%s exFAT/UFS: Library Ready.",
-                  SHADOWMOUNT_VERSION);
-  } else {
+  if (new_games) {
     // SCENARIO B: Work needed.
-    notify_system("ShadowMount+ v%s exFAT/UFS\nFound %d Games. Executing...",
-                  SHADOWMOUNT_VERSION, new_games);
+    notify_system("Found %d Games. Executing...",
+                  new_games);
     process_scan_candidates(g_scan_candidates, new_games);
 
     // Completion Message
