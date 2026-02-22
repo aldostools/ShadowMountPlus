@@ -14,10 +14,15 @@ debug=1
 # 0/false/no/off/rw -> read-write mounts
 mount_read_only=1
 
+# Mounting even damaged file systems
+# 1/true/yes/on  -> include force option
+# 0/false/no/off -> default mount options (default)
+force_mount=0
+
 # Per-image mount mode override by file name (can be repeated many times):
 # image_ro=<image_filename>
 # image_rw=<image_filename>
-# image_ro=PPSA17221.ffpfs
+# image_ro=PPSA12345.ffpfs
 # image_rw=My Game Dump.exfat
 
 # Recursive scan mode:

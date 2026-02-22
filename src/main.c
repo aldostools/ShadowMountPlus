@@ -51,7 +51,7 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.5beta6"
+#define SHADOWMOUNT_VERSION "1.5beta6-fix1"
 #define IMAGE_MOUNT_BASE "/data/imgmnt"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
@@ -343,6 +343,7 @@ typedef enum {
 typedef struct {
   bool debug_enabled;
   bool mount_read_only;
+  bool force_mount;
   bool recursive_scan;
   uint32_t scan_interval_us;
   uint32_t stability_wait_seconds;
@@ -1556,6 +1557,7 @@ static bool is_source_stable_for_mount(const char *path, const char *name,
 static void init_runtime_config_defaults(void) {
   g_runtime_cfg.debug_enabled = true;
   g_runtime_cfg.mount_read_only = (IMAGE_MOUNT_READ_ONLY != 0);
+  g_runtime_cfg.force_mount = false;
   g_runtime_cfg.recursive_scan = false;
   g_runtime_cfg.scan_interval_us = DEFAULT_SCAN_INTERVAL_US;
   g_runtime_cfg.stability_wait_seconds = DEFAULT_STABILITY_WAIT_SECONDS;
@@ -1709,6 +1711,15 @@ static bool load_runtime_config(void) {
       continue;
     }
 
+    if (strcasecmp(key, "force_mount") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      g_runtime_cfg.force_mount = bval;
+      continue;
+    }
+
     if (strcasecmp(key, "image_ro") == 0 ||
         strcasecmp(key, "image_rw") == 0) {
       bool rule_read_only = (strcasecmp(key, "image_ro") == 0);
@@ -1855,12 +1866,13 @@ static bool load_runtime_config(void) {
       image_rule_count++;
   }
 
-  log_debug("  [CFG] loaded: debug=%d ro=%d recursive_scan=%d "
+  log_debug("  [CFG] loaded: debug=%d ro=%d force=%d recursive_scan=%d "
             "exfat_backend=%s ufs_backend=%s "
             "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u) "
             "scan_interval_s=%u stability_wait_s=%u scan_paths=%d image_rules=%d",
             g_runtime_cfg.debug_enabled ? 1 : 0,
             g_runtime_cfg.mount_read_only ? 1 : 0,
+            g_runtime_cfg.force_mount ? 1 : 0,
             g_runtime_cfg.recursive_scan ? 1 : 0,
             backend_name(g_runtime_cfg.exfat_backend),
             backend_name(g_runtime_cfg.ufs_backend),
@@ -2231,6 +2243,7 @@ static bool mount_image(const char *file_path, image_fs_type_t fs_type) {
   g_last_image_mount_errmsg[0] = '\0';
   bool mount_mode_overridden = false;
   bool mount_read_only = g_runtime_cfg.mount_read_only;
+  bool force_mount = g_runtime_cfg.force_mount;
   const char *filename = get_filename_component(file_path);
   if (filename[0] != '\0') {
     for (int k = 0; k < MAX_IMAGE_MODE_RULES; k++) {
@@ -2469,7 +2482,8 @@ static bool mount_image(const char *file_path, image_fs_type_t fs_type) {
       IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
-      IOVEC_ENTRY("errmsg"), {(void *)mount_errmsg, sizeof(mount_errmsg)}};
+      IOVEC_ENTRY("errmsg"), {(void *)mount_errmsg, sizeof(mount_errmsg)},
+      IOVEC_ENTRY("force"),     IOVEC_ENTRY(NULL)};
 
   struct iovec iov_exfat[] = {
       IOVEC_ENTRY("from"),      IOVEC_ENTRY(devname),
@@ -2482,7 +2496,8 @@ static bool mount_image(const char *file_path, image_fs_type_t fs_type) {
       IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("ignoreacl"), IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
-      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
+      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)},
+      IOVEC_ENTRY("force"),     IOVEC_ENTRY(NULL)};
 
   struct iovec iov_pfs[] = {
       IOVEC_ENTRY("from"),      IOVEC_ENTRY(devname),
@@ -2497,21 +2512,22 @@ static bool mount_image(const char *file_path, image_fs_type_t fs_type) {
       IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("noatime"),   IOVEC_ENTRY(NULL),
       IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
-      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)}};
+      IOVEC_ENTRY("errmsg"),    {(void *)mount_errmsg, sizeof(mount_errmsg)},
+      IOVEC_ENTRY("force"),     IOVEC_ENTRY(NULL)};
 
   if (fs_type == IMAGE_FS_UFS) {
     iov = iov_ufs;
-    iovlen = (unsigned int)IOVEC_SIZE(iov_ufs);
+    iovlen = (unsigned int)IOVEC_SIZE(iov_ufs) - (force_mount ? 0u : 2u);
   } else if (fs_type == IMAGE_FS_EXFAT) {
     iov = iov_exfat;
-    iovlen = (unsigned int)IOVEC_SIZE(iov_exfat);
+    iovlen = (unsigned int)IOVEC_SIZE(iov_exfat) - (force_mount ? 0u : 2u);
   } else if (fs_type == IMAGE_FS_PFS) {
     log_debug("  [IMG][%s] PFS ro=%d budgetid=%s mkeymode=%s "
               "sigverify=%s playgo=%s disc=%s ekpfs=zero",
               backend_name(attach_backend), mount_read_only ? 1 : 0,
               PFS_MOUNT_BUDGET_ID, PFS_MOUNT_MKEYMODE, sigverify, playgo, disc);
     iov = iov_pfs;
-    iovlen = (unsigned int)IOVEC_SIZE(iov_pfs);
+    iovlen = (unsigned int)IOVEC_SIZE(iov_pfs) - (force_mount ? 0u : 2u);
   } else {
     log_debug("  [IMG][%s] unsupported fstype=%s", backend_name(attach_backend),
               image_fs_name(fs_type));

@@ -1,6 +1,6 @@
 # ShadowMountPlus (PS5)
 
-**Version:** `1.5beta6`
+**Version:** `1.5beta6-fix1`
 
 **Repository:** https://github.com/drakmor/shadowMountPlus
 
@@ -40,6 +40,7 @@ This file is optional. If it does not exist, built-in defaults are used.
 Supported keys (all optional):
 - `debug=1|0` (`1` enables `log_debug` output to console + `/data/shadowmount/debug.log`; default is `1`)
 - `mount_read_only=1|0` (default: `1`)
+- `force_mount=1|0` (mounting even damaged file systems; default: `0`)
 - `image_ro=<image_filename>` (repeatable; force read-only mode for this image filename)
 - `image_rw=<image_filename>` (repeatable; force read-write mode for this image filename)
 - `recursive_scan=1|0` (`0` = scan only first-level subfolders, `1` = recursive scan without depth limit; default: `0`)
