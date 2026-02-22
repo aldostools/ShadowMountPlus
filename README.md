@@ -62,8 +62,8 @@ Per-image mode override behavior:
 - Example:
 ```ini
 mount_read_only=1
-image_rw=PPSA08766-Cocoon-01.004.000.ffpfs
-image_rw=DIRT 5.exfat
+image_rw=PPSA1234-my-image.ffpfs
+image_rw=MYGame 123.exfat
 image_ro=legacy_dump.ffpkg
 ```
 
