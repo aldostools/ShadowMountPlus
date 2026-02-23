@@ -52,7 +52,7 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.6test1"
+#define SHADOWMOUNT_VERSION "1.6test2"
 #define PAYLOAD_NAME "shadowmountplus.elf"
 #define IMAGE_MOUNT_BASE "/data/imgmnt"
 #define IMAGE_MOUNT_SUBDIR_UFS "ufsmnt"
@@ -1021,6 +1021,42 @@ static bool read_mount_link(const char *title_id, char *out, size_t out_size) {
   char lnk_path[MAX_PATH];
   snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", title_id);
   return read_mount_link_file(lnk_path, out, out_size);
+}
+
+static bool mount_title_nullfs(const char *title_id, const char *src_path) {
+  char dst[MAX_PATH];
+  snprintf(dst, sizeof(dst), "/system_ex/app/%s", title_id);
+
+  struct statfs mntst;
+  if (statfs(dst, &mntst) == 0 && strcmp(mntst.f_mntonname, dst) == 0) {
+    if (strcmp(mntst.f_fstypename, "nullfs") == 0 &&
+        strcmp(mntst.f_mntfromname, src_path) == 0)
+      return true;
+    log_debug("  [LINK] Mount point busy: %s (%s from %s)", dst,
+              mntst.f_fstypename, mntst.f_mntfromname);
+    return false;
+  }
+
+  if (mkdir(dst, 0755) != 0 && errno != EEXIST) {
+    log_debug("  [LINK] Failed to create mount directory for title %s: %s",
+              title_id, strerror(errno));
+    return false;
+  }
+
+  struct iovec iov[] = {
+      IOVEC_ENTRY("fstype"), IOVEC_ENTRY("nullfs"), 
+      IOVEC_ENTRY("from"), IOVEC_ENTRY(src_path), 
+      IOVEC_ENTRY("fspath"), IOVEC_ENTRY(dst),
+  };
+
+  if (nmount(iov, IOVEC_SIZE(iov), 0) != 0) {
+    log_debug("  [LINK] Failed to auto-mount title %s -> %s: %s", title_id,
+              src_path, strerror(errno));
+    return false;
+  }
+
+  log_debug("  [LINK] Auto-mounted title %s -> %s", title_id, src_path);
+  return true;
 }
 
 static bool path_matches_root_or_child(const char *path, const char *root) {
@@ -2684,9 +2720,9 @@ static bool mount_image(const char *file_path, image_fs_type_t fs_type) {
              g_runtime_cfg.backports_path, title_id);
     if (stat(backport_path, &backport_st) == 0 && S_ISDIR(backport_st.st_mode)) {
       struct iovec overlay_iov[] = {
-          IOVEC_ENTRY("fstype"), IOVEC_ENTRY("unionfs"), IOVEC_ENTRY("from"),
-          IOVEC_ENTRY(backport_path), IOVEC_ENTRY("fspath"),
-          IOVEC_ENTRY(mount_point)};
+          IOVEC_ENTRY("fstype"), IOVEC_ENTRY("unionfs"), 
+          IOVEC_ENTRY("from"),   IOVEC_ENTRY(backport_path),
+          IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point)};
       int overlay_flags = mount_read_only ? MNT_RDONLY : 0;
       if (nmount(overlay_iov, IOVEC_SIZE(overlay_iov), overlay_flags) == 0) {
         log_debug("  [IMG] backport overlay mounted (%s): %s -> %s",
@@ -3132,6 +3168,17 @@ static bool try_collect_candidate_for_directory(
     return true;
   }
   bool in_app_db = app_db_title_list_contains(app_db_titles, title_id);
+  bool installed = in_app_db && is_installed(title_id);
+  char tracked_path[MAX_PATH];
+  bool link_matches_source =
+      installed && read_mount_link(title_id, tracked_path, sizeof(tracked_path)) &&
+      strcmp(tracked_path, full_path) == 0;
+  bool mounted = false;
+  if (link_matches_source) {
+    mounted = is_data_mounted(title_id);
+    if (!mounted && mount_title_nullfs(title_id, full_path))
+      mounted = is_data_mounted(title_id);
+  }
 
   if (in_app_db) {
     for (int k = 0; k < MAX_PENDING; k++) {
@@ -3157,16 +3204,12 @@ static bool try_collect_candidate_for_directory(
   }
 
   // Installed status requires both app files and app.db presence.
-  bool installed = is_installed(title_id) && in_app_db;
-  char tracked_path[MAX_PATH];
-  if (installed &&
-      read_mount_link(title_id, tracked_path, sizeof(tracked_path)) &&
-      strcmp(tracked_path, full_path) == 0) {
-    if (is_data_mounted(title_id))
+  if (link_matches_source) {
+    if (mounted)
       log_debug("  [SKIP] already installed+mounted+linked: %s (%s)", title_name,
                 title_id);
     else
-      log_debug("  [SKIP] already installed+linked (waiting kstuff mount): %s (%s)",
+      log_debug("  [SKIP] already installed+linked (mount pending): %s (%s)",
                 title_name, title_id);
     return true;
   }
@@ -3393,6 +3436,8 @@ bool mount_and_install(const char *src_path, const char *title_id,
   if (!link_ok) {
     return false;
   }
+
+  (void)mount_title_nullfs(title_id, src_path);
 
   if (!should_register) {
     log_debug("  [REG] Skip (already present in app.db)");
