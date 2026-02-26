@@ -53,7 +53,7 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.6beta1"
+#define SHADOWMOUNT_VERSION "1.6beta2"
 #define PAYLOAD_NAME "shadowmountplus.elf"
 #define IMAGE_MOUNT_BASE "/data/imgmnt"
 #define IMAGE_MOUNT_SUBDIR_UFS "ufsmnt"
