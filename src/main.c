@@ -41,6 +41,8 @@
 #define MAX_MISSING_PARAM_SCAN_ATTEMPTS 3
 #define MAX_IMAGE_MOUNT_ATTEMPTS 3
 #define MAX_LAYERED_UNMOUNT_ATTEMPTS 4
+#define LVD1_RELEASE_WAIT_MAX_US 15000000u
+#define LVD1_RELEASE_WAIT_POLL_US 500000u
 #define IMAGE_MOUNT_READ_ONLY 1
 #define MIN_SCAN_INTERVAL_SECONDS 1u
 #define MAX_SCAN_INTERVAL_SECONDS 3600u
@@ -53,7 +55,7 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.6beta2"
+#define SHADOWMOUNT_VERSION "1.6beta3"
 #define PAYLOAD_NAME "shadowmountplus.elf"
 #define IMAGE_MOUNT_BASE "/data/imgmnt"
 #define IMAGE_MOUNT_SUBDIR_UFS "ufsmnt"
@@ -2224,31 +2226,51 @@ static bool is_active_image_mount_point(const char *path) {
 }
 
 static bool wait_for_lvd1_release(void) {
-  bool was_waiting = false;
-  while (true) {
+  for (unsigned int waited_us = 0;; waited_us += LVD1_RELEASE_WAIT_POLL_US) {
     struct statfs *mntbuf = NULL;
     int mntcount = getmntinfo(&mntbuf, MNT_NOWAIT);
     bool mounted = false;
     for (int i = 0; i < mntcount && mntbuf; i++) {
-      if (strcmp(mntbuf[i].f_mntfromname, "/dev/lvd1") == 0) {
-        mounted = true;
-        break;
-      }
-    }
-    if (!mounted)
+      if (strcmp(mntbuf[i].f_mntfromname, "/dev/lvd1") != 0)
+        continue;
+      mounted = true;
       break;
+    }
+    if (!mounted) {
+      if (waited_us != 0)
+        log_debug("  [IMG][LVD] /dev/lvd1 released");
+      return true;
+    }
 
-    if (!was_waiting) {
+    if (waited_us == 0) {
       log_debug("  [IMG][LVD] waiting for /dev/lvd1 to be released...");
-      was_waiting = true;
+      for (int i = 0; i < mntcount && mntbuf; i++) {
+        if (strncmp(mntbuf[i].f_mntfromname, "/dev/lvd", 8) != 0)
+          continue;
+        log_debug("  [IMG][LVD] mounted: from=%s path=%s type=%s "
+                  "bsize=%llu iosize=%llu blocks=%llu bfree=%llu "
+                  "bavail=%llu files=%llu ffree=%llu flags=0x%lX",
+                  mntbuf[i].f_mntfromname, mntbuf[i].f_mntonname,
+                  mntbuf[i].f_fstypename,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_bsize,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_iosize,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_blocks,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_bfree,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_bavail,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_files,
+                  (unsigned long long)(uint64_t)mntbuf[i].f_ffree,
+                  (unsigned long)mntbuf[i].f_flags);
+      }
     }
     if (should_stop_requested())
       return false;
-    sceKernelUsleep(500000);
+    if (waited_us >= LVD1_RELEASE_WAIT_MAX_US) {
+      log_debug("  [IMG][LVD] /dev/lvd1 wait timeout reached (%u ms), "
+                "continuing startup", LVD1_RELEASE_WAIT_MAX_US / 1000u);
+      return true;
+    }
+    sceKernelUsleep(LVD1_RELEASE_WAIT_POLL_US);
   }
-  if (was_waiting)
-    log_debug("  [IMG][LVD] /dev/lvd1 released");
-  return true;
 }
 
 // --- Device Detach Helpers ---

@@ -1,6 +1,6 @@
 # ShadowMountPlus (PS5)
 
-**Version:** `1.6beta1`
+**Version:** `1.6beta3`
 
 **Repository:** https://github.com/drakmor/shadowMountPlus
 
