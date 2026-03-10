@@ -10,7 +10,7 @@
 **ShadowMountPlus** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMountPlus automatically detects, mounts, and installs game dumps from both **internal and external storage**.
 
 
-**Compatibility:** Supports all Jailbroken PS5 firmwares running **Kstuff v1.6.6+** or **Kstuff-lite v1.0+**.
+**Compatibility:** Supports all Jailbroken PS5 firmwares running **Kstuff v1.6.6+ (Recommended 1.6.6)** or **Kstuff-lite v1.0+**.
 
 
 ## Current image support
