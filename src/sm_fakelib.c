@@ -23,7 +23,10 @@ static bool mount_fakelib_overlay(const char *title_id,
   struct iovec overlay_iov[] = {
       IOVEC_ENTRY("fstype"), IOVEC_ENTRY("unionfs"),
       IOVEC_ENTRY("from"),   IOVEC_ENTRY(source_path),
-      IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_path)};
+      IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_path),
+      IOVEC_ENTRY("copymode"), IOVEC_ENTRY("transparent"),
+      IOVEC_ENTRY("notime"), IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("fnodup"), IOVEC_ENTRY(NULL)};
 
   if (nmount(overlay_iov, IOVEC_SIZE(overlay_iov), 0) == 0) {
     notify_system_info("Game backported: %s", title_id);

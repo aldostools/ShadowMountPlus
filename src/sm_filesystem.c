@@ -503,7 +503,10 @@ void mount_backport_overlay(const char *mount_point,
   struct iovec overlay_iov[] = {
       IOVEC_ENTRY("fstype"), IOVEC_ENTRY("unionfs"),
       IOVEC_ENTRY("from"),   IOVEC_ENTRY(backport_path),
-      IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point)};
+      IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point),
+      IOVEC_ENTRY("copymode"), IOVEC_ENTRY("transparent"),
+      IOVEC_ENTRY("notime"), IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("fnodup"), IOVEC_ENTRY(NULL)};
   int overlay_flags = mount_read_only ? MNT_RDONLY : 0;
   if (nmount(overlay_iov, IOVEC_SIZE(overlay_iov), overlay_flags) == 0) {
     log_debug("  [IMG] backport overlay mounted (%s): %s -> %s",
