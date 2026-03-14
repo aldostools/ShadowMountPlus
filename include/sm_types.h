@@ -29,14 +29,12 @@ typedef struct {
 } devpfs_mount_profile_t;
 
 typedef struct {
-  // Source object class (observed: 1=file, 2=device-like source).
+  // Source object class (observed: 1=file, 2=device-like/special source).
   uint16_t source_type;
-  // Layer behavior flags (observed bit0 = no bitmap file path).
-  uint8_t entry_flags;
+  // Layer descriptor flags (observed bit0 = no bitmap file path).
+  uint16_t flags;
   // Must be zero.
-  uint8_t reserved0;
-  // Must be zero.
-  uint32_t reserved1;
+  uint32_t reserved0;
   // Backing file or device path.
   const char *path;
   // Data start offset in backing object (bytes).
@@ -49,28 +47,28 @@ typedef struct {
   uint64_t bitmap_offset;
   // Bitmap size (bytes), 0 when bitmap is unused.
   uint64_t bitmap_size;
-} lvd_kernel_layer_t;
+} lvd_ioctl_layer_v0_t;
 
 typedef struct {
-  // Protocol version for /dev/lvdctl ioctl payload (valid <=1).
+  // Protocol version for /dev/lvdctl ioctl payload (0 = V0/base attach).
   uint32_t io_version;
   // Input: usually -1 for auto-assign. Output: created lvd unit id.
   int32_t device_id;
-  // Sector-like size fields used by LVD attach request validation.
-  // In refs these are populated from statfs and clamped to <= 4096.
-  uint32_t sector_size_0;
-  uint32_t sector_size_1;
-  // Encoded option length derived from option flags (0x14 for 0x8, 0x1C for 0x9).
-  uint16_t option_len;
-  // LVD image type id (validator accepts 0..0xC; this code uses 0).
+  // User-visible sector size exported by /dev/lvdN.
+  uint32_t sector_size;
+  // Secondary unit/granularity validated against sector_size.
+  uint32_t secondary_unit;
+  // Normalized attach flags produced from wrapper raw options.
+  uint16_t flags;
+  // LVD image type id (validator accepts 0..0xC).
   uint16_t image_type;
   // Number of valid entries in layers_ptr.
   uint32_t layer_count;
   // Total exported virtual size (bytes).
   uint64_t device_size;
-  // Pointer to layer array in user payload.
-  lvd_kernel_layer_t *layers_ptr;
-} lvd_ioctl_attach_t;
+  // Pointer to V0 layer array in user payload.
+  lvd_ioctl_layer_v0_t *layers_ptr;
+} lvd_ioctl_attach_v0_t;
 
 typedef struct {
   // Must be zero.

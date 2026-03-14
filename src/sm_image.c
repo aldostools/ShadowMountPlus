@@ -23,7 +23,7 @@ static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   return false;
 }
 
-static uint32_t get_lvd_sector_size(image_fs_type_t fs_type) {
+static uint32_t get_lvd_sector_size_fallback(image_fs_type_t fs_type) {
   const runtime_config_t *cfg = runtime_config();
   switch (fs_type) {
   case IMAGE_FS_UFS:
@@ -34,6 +34,31 @@ static uint32_t get_lvd_sector_size(image_fs_type_t fs_type) {
   default:
     return cfg->lvd_sector_exfat;
   }
+}
+
+static uint32_t get_lvd_sector_size(const char *path, image_fs_type_t fs_type) {
+  uint32_t fallback = get_lvd_sector_size_fallback(fs_type);
+  if (!path)
+    return fallback;
+
+  struct statfs sfs;
+  if (statfs(path, &sfs) != 0)
+    return fallback;
+
+  uint64_t fs_cluster_size = (uint64_t)sfs.f_bsize;
+  if (fs_cluster_size == 0)
+    fs_cluster_size = (uint64_t)sfs.f_iosize;
+  if (fs_cluster_size == 0 || fs_cluster_size >= (uint64_t)fallback)
+    return fallback;
+
+  return (uint32_t)fs_cluster_size;
+}
+
+static uint32_t get_lvd_secondary_unit(const char *path,
+                                       image_fs_type_t fs_type) {
+  if (fs_type == IMAGE_FS_EXFAT)
+    return LVD_SECONDARY_UNIT_SINGLE_IMAGE;
+  return get_lvd_sector_size(path, fs_type);
 }
 
 static uint32_t get_md_sector_size(image_fs_type_t fs_type) {
@@ -54,14 +79,14 @@ static unsigned int get_md_attach_options(bool mount_read_only) {
   return options;
 }
 
-static uint16_t get_lvd_attach_option(image_fs_type_t fs_type,
-                                      bool mount_read_only) {
-  if (fs_type == IMAGE_FS_UFS) {
-    return mount_read_only ? LVD_ATTACH_OPTION_NORM_DD_RO
-                           : LVD_ATTACH_OPTION_NORM_DD_RW;
+static uint16_t get_lvd_attach_raw_flags(image_fs_type_t fs_type,
+                                         bool mount_read_only) {
+    if (fs_type == IMAGE_FS_UFS) {
+    return mount_read_only ? LVD_ATTACH_RAW_FLAGS_DD_RO
+                           : LVD_ATTACH_RAW_FLAGS_DD_RW;
   }
-  return mount_read_only ? LVD_ATTACH_OPTION_FLAGS_DEFAULT
-                         : LVD_ATTACH_OPTION_FLAGS_RW;
+  return mount_read_only ? LVD_ATTACH_RAW_FLAGS_SINGLE_RO
+                         : LVD_ATTACH_RAW_FLAGS_SINGLE_RW;
 }
 
 static unsigned int get_nmount_flags(image_fs_type_t fs_type,
@@ -77,15 +102,38 @@ static unsigned int get_nmount_flags(image_fs_type_t fs_type,
   return mount_read_only ? MNT_RDONLY : 0;
 }
 
-static uint16_t lvd_option_len_from_flags(uint16_t options) {
-  if ((options & 0x800Eu) != 0u) {
-    uint32_t raw = (uint32_t)options;
+static uint16_t normalize_lvd_raw_flags(uint16_t raw_flags) {
+  if ((raw_flags & 0x800Eu) != 0u) {
+    uint32_t raw = (uint32_t)raw_flags;
     uint32_t len = (raw & 0xFFFF8000u) + ((raw & 2u) << 6) +
                    (8u * (raw & 1u)) + (2u * ((raw >> 2) & 1u)) +
                    (2u * (raw & 8u)) + 4u;
     return (uint16_t)len;
   }
-  return (uint16_t)(8u * ((uint32_t)options & 1u) + 4u);
+  return (uint16_t)(8u * ((uint32_t)raw_flags & 1u) + 4u);
+}
+
+static uint16_t get_lvd_image_type(image_fs_type_t fs_type) {
+  if (fs_type == IMAGE_FS_UFS)
+    return LVD_ATTACH_IMAGE_TYPE_UFS_DOWNLOAD_DATA;
+  if (fs_type == IMAGE_FS_PFS)
+    return LVD_ATTACH_IMAGE_TYPE_PFS_SAVE_DATA;
+  return LVD_ATTACH_IMAGE_TYPE_SINGLE;
+}
+
+static uint16_t get_lvd_source_type(const char *path) {
+  if (!path)
+    return LVD_ENTRY_TYPE_FILE;
+
+  if (strncmp(path, "/dev/sbram0", strlen("/dev/sbram0")) == 0)
+    return LVD_ENTRY_TYPE_SPECIAL;
+
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+      return LVD_ENTRY_TYPE_SPECIAL;
+  }
+  return LVD_ENTRY_TYPE_FILE;
 }
 
 // --- Image Path and Naming Helpers ---
@@ -271,49 +319,42 @@ static bool attach_lvd_backend(const char *file_path, image_fs_type_t fs_type,
     return false;
   }
 
-  lvd_kernel_layer_t *layers =
-      calloc(LVD_ATTACH_LAYER_ARRAY_SIZE, sizeof(*layers));
-  if (!layers) {
-    log_debug("  [IMG] calloc layers failed");
-    close(lvd_fd);
-    return false;
-  }
-
-  layers[0].source_type = LVD_ENTRY_TYPE_FILE;
-  layers[0].entry_flags = LVD_ENTRY_FLAG_NO_BITMAP;
+  lvd_ioctl_layer_v0_t layers[LVD_ATTACH_LAYER_COUNT];
+  memset(layers, 0, sizeof(layers));
+  layers[0].source_type = get_lvd_source_type(file_path);
+  layers[0].flags = LVD_ENTRY_FLAG_NO_BITMAP;
   layers[0].path = file_path;
   layers[0].offset = 0;
   layers[0].size = (uint64_t)file_size;
 
-  lvd_ioctl_attach_t req;
+  uint32_t sector_size = get_lvd_sector_size(file_path, fs_type);
+  uint32_t secondary_unit = get_lvd_secondary_unit(file_path, fs_type);
+  uint16_t raw_flags = get_lvd_attach_raw_flags(fs_type, mount_read_only);
+  uint16_t normalized_flags = normalize_lvd_raw_flags(raw_flags);
+
+  lvd_ioctl_attach_v0_t req;
   memset(&req, 0, sizeof(req));
-  req.io_version = LVD_ATTACH_IO_VERSION;
-  req.image_type = (fs_type == IMAGE_FS_UFS)
-                       ? LVD_ATTACH_IMAGE_TYPE_UFS_DOWNLOAD_DATA
-                       : (fs_type == IMAGE_FS_PFS)
-                             ? LVD_ATTACH_IMAGE_TYPE_PFS_SAVE_DATA
-                             : LVD_ATTACH_IMAGE_TYPE;
+  req.io_version = LVD_ATTACH_IO_VERSION_V0;
+  req.image_type = get_lvd_image_type(fs_type);
   req.layer_count = LVD_ATTACH_LAYER_COUNT;
   req.device_size = (uint64_t)file_size;
   req.layers_ptr = layers;
-  req.sector_size_0 = get_lvd_sector_size(fs_type);
-  req.sector_size_1 = req.sector_size_0;
-
-  uint16_t attach_option = get_lvd_attach_option(fs_type, mount_read_only);
-  req.option_len = (fs_type == IMAGE_FS_UFS) ? attach_option
-                                              : lvd_option_len_from_flags(attach_option);
+  req.sector_size = sector_size;
+  req.secondary_unit = secondary_unit;
+  req.flags = normalized_flags;
   req.device_id = -1;
 
   int last_errno = 0;
-  log_debug("  [IMG][%s] attach try: ver=%u sec=%u options=0x%x len=0x%x",
+  log_debug("  [IMG][%s] attach try: ver=%u sec=%u sec2=%u raw=0x%x "
+            "flags=0x%x img=%u",
             attach_backend_name(ATTACH_BACKEND_LVD), req.io_version,
-            req.sector_size_0, attach_option, req.option_len);
-  int ret = ioctl(lvd_fd, SCE_LVD_IOC_ATTACH, &req);
+            req.sector_size, req.secondary_unit, raw_flags, req.flags,
+            req.image_type);
+  int ret = ioctl(lvd_fd, SCE_LVD_IOC_ATTACH_V0, &req);
   if (ret != 0)
     last_errno = errno;
   close(lvd_fd);
   int unit_id = req.device_id;
-  free(layers);
 
   if (ret != 0) {
     errno = last_errno;
@@ -580,7 +621,8 @@ static bool validate_mounted_image(const char *file_path, image_fs_type_t fs_typ
 
   uint32_t min_device_sector =
       (attach_backend == ATTACH_BACKEND_MD) ? get_md_sector_size(fs_type)
-                                            : get_lvd_sector_size(fs_type);
+                                            : get_lvd_sector_size(file_path,
+                                                                  fs_type);
   uint64_t fs_block_size = (uint64_t)mounted_sfs.f_bsize;
   if (fs_block_size >= (uint64_t)min_device_sector)
     return true;

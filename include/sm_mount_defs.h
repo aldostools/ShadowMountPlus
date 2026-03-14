@@ -9,36 +9,46 @@
 #define UFS_ATTACH_USE_MDCTL 0
 
 // --- LVD Definitions ---
-// - ioctl: ATTACH=0xC0286D00, DETACH=0xC0286D01, ATTACH2 path=0xC0286D09.
-// - single-image path uses raw option flags 0x8/0x9 -> normalized 0x14/0x1C.
-// - DownloadData/LWFS path (imgtype=7) uses normalized options 0x16/0x1E.
-// - image_type values accepted by validator: 0..0xC (13 values total).
-//   this code uses image_type=7 for UFS (DownloadData-like), 0 for generic path.
-// - layer source_type observed: 1=file, 2=char/block-like source (/dev/sbram0).
-// - layer entry flag bit0 is "no bitmap file specified".
+// Kernel exposes base attach (V0), extended attach (V1/Attach2) and detach.
+// This code only builds V0 layer descriptors, so it uses the base attach path.
+// Wrapper-side raw attach presets:
+// - 0x8/0x9 -> single-image/save-data family (normalized 0x14/0x1C)
+// - 0xC/0xD -> download-data/LWFS family (normalized 0x16/0x1E)
+// raw bit3 (0x8) sets the DONT_MAP_BM-style mode, raw bit2 (0x4) switches to
+// the DD/LWFS family, and raw bit0 (0x1) selects the alternate preset inside a
+// family. Firmware pairs bit0 with read-only mount variants, but this is not a
+// standalone LVD readonly bit by itself.
+// image_type values accepted by validator: 0..0xC (13 values total).
+// layer source_type observed: 1=file, 2=device/special source (/dev/sbram0, char/block).
+// layer descriptor flag bit0 is "no bitmap file specified".
 #define LVD_CTRL_PATH "/dev/lvdctl"
 #define MD_CTRL_PATH "/dev/mdctl"
-#define SCE_LVD_IOC_ATTACH 0xC0286D00
+#define SCE_LVD_IOC_ATTACH_V0 0xC0286D00
+#define SCE_LVD_IOC_ATTACH_V1 0xC0286D09
 #define SCE_LVD_IOC_DETACH 0xC0286D01
-#define LVD_ATTACH_IO_VERSION 1
-#define LVD_ATTACH_OPTION_FLAGS_DEFAULT 0x9
-#define LVD_ATTACH_OPTION_FLAGS_RW 0x8
-#define LVD_ATTACH_OPTION_NORM_DD_RO 0x1E
-#define LVD_ATTACH_OPTION_NORM_DD_RW 0x16
+#define LVD_ATTACH_IO_VERSION_V0 0u
+#define LVD_ATTACH_IO_VERSION_V1 1u
+#define LVD_ATTACH_RAW_FLAGS_SINGLE_RO 0x9
+#define LVD_ATTACH_RAW_FLAGS_SINGLE_RW 0x8
+#define LVD_ATTACH_RAW_FLAGS_DD_RO 0xD
+#define LVD_ATTACH_RAW_FLAGS_DD_RW 0xC
+#
 #define LVD_SECTOR_SIZE_EXFAT 512u
 #define LVD_SECTOR_SIZE_UFS 4096u
-#define LVD_SECTOR_SIZE_PFS 32768u
+#define LVD_SECTOR_SIZE_PFS 4096u
+#define LVD_SECONDARY_UNIT_SINGLE_IMAGE 0x10000u
 #define MD_SECTOR_SIZE_EXFAT 512u
 #define MD_SECTOR_SIZE_UFS 512u
 // Raw option bits are normalized by sceFsLvdAttachCommon before validation:
 // raw:0x1->norm:0x08, raw:0x2->norm:0x80, raw:0x4->norm:0x02, raw:0x8->norm:0x10.
 // The normalized masks are then checked against validator constraints (0x82/0x92).
-#define LVD_ATTACH_IMAGE_TYPE 0
+#define LVD_ATTACH_IMAGE_TYPE_SINGLE 0
 #define LVD_ATTACH_IMAGE_TYPE_UFS_DOWNLOAD_DATA 7
-#define LVD_ATTACH_IMAGE_TYPE_PFS_SAVE_DATA 0 // also works 5
+#define LVD_ATTACH_IMAGE_TYPE_PFS_SAVE_DATA 5
 #define LVD_ATTACH_LAYER_COUNT 1
 #define LVD_ATTACH_LAYER_ARRAY_SIZE 3
 #define LVD_ENTRY_TYPE_FILE 1
+#define LVD_ENTRY_TYPE_SPECIAL 2
 #define LVD_ENTRY_FLAG_NO_BITMAP 0x1
 #define LVD_NODE_WAIT_US 100000
 #define LVD_NODE_WAIT_RETRIES 100
