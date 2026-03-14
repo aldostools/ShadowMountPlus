@@ -209,18 +209,7 @@ static void strip_extension(const char *filename, char *out, size_t out_size) {
   out[len] = '\0';
 }
 
-static const char *image_fs_subdir(image_fs_type_t fs_type) {
-  if (fs_type == IMAGE_FS_UFS)
-    return IMAGE_MOUNT_SUBDIR_UFS;
-  if (fs_type == IMAGE_FS_EXFAT)
-    return IMAGE_MOUNT_SUBDIR_EXFAT;
-  if (fs_type == IMAGE_FS_PFS)
-    return IMAGE_MOUNT_SUBDIR_PFS;
-  return "unknown";
-}
-
 static void build_image_mount_point(const char *file_path,
-                                    image_fs_type_t fs_type,
                                     char mount_point[MAX_PATH]) {
   const char *filename = get_filename_component(file_path);
   char base_name[MAX_PATH];
@@ -236,8 +225,7 @@ static void build_image_mount_point(const char *file_path,
   snprintf(mount_name + base_len, sizeof(mount_name) - base_len, "_%08x",
            sm_fnv1a32(file_path));
 
-  snprintf(mount_point, MAX_PATH, "%s/%s/%s", IMAGE_MOUNT_BASE,
-           image_fs_subdir(fs_type), mount_name);
+  snprintf(mount_point, MAX_PATH, "%s/%s", IMAGE_MOUNT_BASE, mount_name);
 }
 
 typedef bool (*image_attach_fn)(const char *file_path, image_fs_type_t fs_type,
@@ -474,12 +462,8 @@ static bool stat_image_file(const char *file_path, struct stat *st_out) {
   return true;
 }
 
-static void ensure_mount_dirs(const char *mount_point, image_fs_type_t fs_type) {
-  char fs_mount_root[MAX_PATH];
-  snprintf(fs_mount_root, sizeof(fs_mount_root), "%s/%s", IMAGE_MOUNT_BASE,
-           image_fs_subdir(fs_type));
+static void ensure_mount_dirs(const char *mount_point) {
   mkdir(IMAGE_MOUNT_BASE, 0777);
-  mkdir(fs_mount_root, 0777);
   mkdir(mount_point, 0777);
 }
 
@@ -660,7 +644,7 @@ bool mount_image(const char *file_path, image_fs_type_t fs_type) {
     return true;
 
   char mount_point[MAX_PATH];
-  build_image_mount_point(file_path, fs_type, mount_point);
+  build_image_mount_point(file_path, mount_point);
   struct stat st;
   bool cache_failed = false;
   if (reuse_existing_image_mount(file_path, mount_point, &cache_failed))
@@ -677,7 +661,7 @@ bool mount_image(const char *file_path, image_fs_type_t fs_type) {
               mount_read_only ? "ro" : "rw");
   }
 
-  ensure_mount_dirs(mount_point, fs_type);
+  ensure_mount_dirs(mount_point);
 
   attach_backend_t attach_backend = select_image_backend(cfg, fs_type);
   log_debug("  [IMG][%s] attach backend selected for %s",
@@ -720,8 +704,7 @@ bool mount_image(const char *file_path, image_fs_type_t fs_type) {
 
 bool unmount_image(const char *file_path, int unit_id, attach_backend_t backend) {
   char mount_point[MAX_PATH];
-  image_fs_type_t fs_type = detect_image_fs_type(file_path);
-  build_image_mount_point(file_path, fs_type, mount_point);
+  build_image_mount_point(file_path, mount_point);
   int resolved_unit = unit_id;
   attach_backend_t resolved_backend = backend;
 
@@ -822,7 +805,7 @@ void cleanup_stale_image_mounts(void) {
 
     image_fs_type_t fs_type = detect_image_fs_type(cached_entry.path);
     char mount_point[MAX_PATH];
-    build_image_mount_point(cached_entry.path, fs_type, mount_point);
+    build_image_mount_point(cached_entry.path, mount_point);
     if (is_active_image_mount_point(mount_point))
       continue;
 
@@ -878,59 +861,14 @@ void cleanup_mount_dirs(void) {
     if (!is_dir)
       continue;
 
-    bool is_fs_root = (strcmp(entry->d_name, IMAGE_MOUNT_SUBDIR_UFS) == 0) ||
-                      (strcmp(entry->d_name, IMAGE_MOUNT_SUBDIR_EXFAT) == 0) ||
-                      (strcmp(entry->d_name, IMAGE_MOUNT_SUBDIR_PFS) == 0);
-    if (!is_fs_root) {
-      if (rmdir(full_path) == 0) {
-        log_debug("  [IMG] removed empty mount dir: %s", full_path);
-        continue;
-      }
-      if (errno == ENOTEMPTY || errno == EBUSY || errno == ENOENT)
-        continue;
-      log_debug("  [IMG] failed to remove mount dir %s: %s", full_path,
-                strerror(errno));
+    if (rmdir(full_path) == 0) {
+      log_debug("  [IMG] removed empty mount dir: %s", full_path);
       continue;
     }
-
-    DIR *sub = opendir(full_path);
-    if (!sub) {
-      if (errno != ENOENT)
-        log_debug("  [IMG] open %s failed: %s", full_path, strerror(errno));
+    if (errno == ENOTEMPTY || errno == EBUSY || errno == ENOENT)
       continue;
-    }
-    struct dirent *sub_entry;
-    while ((sub_entry = readdir(sub)) != NULL) {
-      if (should_stop_requested())
-        break;
-      if (sub_entry->d_name[0] == '.')
-        continue;
-
-      char sub_path[MAX_PATH];
-      snprintf(sub_path, sizeof(sub_path), "%s/%s", full_path,
-               sub_entry->d_name);
-
-      bool is_sub_dir = false;
-      if (sub_entry->d_type == DT_DIR) {
-        is_sub_dir = true;
-      } else if (sub_entry->d_type == DT_UNKNOWN) {
-        struct stat sub_st;
-        if (stat(sub_path, &sub_st) == 0)
-          is_sub_dir = S_ISDIR(sub_st.st_mode);
-      }
-      if (!is_sub_dir)
-        continue;
-
-      if (rmdir(sub_path) == 0) {
-        log_debug("  [IMG] removed empty mount dir: %s", sub_path);
-        continue;
-      }
-      if (errno == ENOTEMPTY || errno == EBUSY || errno == ENOENT)
-        continue;
-      log_debug("  [IMG] failed to remove mount dir %s: %s", sub_path,
-                strerror(errno));
-    }
-    closedir(sub);
+    log_debug("  [IMG] failed to remove mount dir %s: %s", full_path,
+              strerror(errno));
   }
 
   closedir(d);

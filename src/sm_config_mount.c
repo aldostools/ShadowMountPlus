@@ -99,9 +99,7 @@ static void init_runtime_scan_paths_defaults(void) {
   clear_runtime_scan_paths();
   for (int i = 0; k_default_scan_paths[i] != NULL; i++)
     (void)add_runtime_scan_path(k_default_scan_paths[i]);
-  (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_UFS);
-  (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_EXFAT);
-  (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_PFS);
+  (void)add_runtime_scan_path(IMAGE_MOUNT_BASE);
 }
 
 static void clear_kstuff_title_rules(void) {
@@ -651,9 +649,7 @@ bool load_runtime_config(void) {
     log_debug("  [CFG] no valid scanpath entries, using defaults");
     init_runtime_scan_paths_defaults();
   } else {
-    (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_UFS);
-    (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_EXFAT);
-    (void)add_runtime_scan_path(IMAGE_MOUNT_BASE "/" IMAGE_MOUNT_SUBDIR_PFS);
+    (void)add_runtime_scan_path(IMAGE_MOUNT_BASE);
   }
 
   int image_rule_count = 0;

@@ -1,10 +1,7 @@
 #ifndef SM_PATHS_H
 #define SM_PATHS_H
 
-#define IMAGE_MOUNT_BASE "/data/imgmnt"
-#define IMAGE_MOUNT_SUBDIR_UFS "ufsmnt"
-#define IMAGE_MOUNT_SUBDIR_EXFAT "exfatmnt"
-#define IMAGE_MOUNT_SUBDIR_PFS "pfsmnt"
+#define IMAGE_MOUNT_BASE "/mnt/shadowmnt"
 
 #define DEFAULT_BACKPORTS_DIR_NAME "backports"
 #define LOG_DIR "/data/shadowmount"

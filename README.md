@@ -77,7 +77,7 @@ image_ro=legacy_dump.ffpkg
 
 Scan path behavior:
 - If at least one `scanpath=...` is present, only those custom paths are used.
-- `/data/imgmnt/{ufsmnt,exfatmnt,pfsmnt}` are always added automatically, even with custom paths.
+- `/mnt/shadowmnt` is always added automatically, even with custom paths.
 - With `recursive_scan=0` (default), only first-level subfolders are checked.
 - With `recursive_scan=1`, subfolders are scanned recursively.
 - Full scan loop runs every `scan_interval_seconds` (default: `10`).
@@ -108,9 +108,7 @@ Validation:
 
 Image mountpoints are created under:
 
-`/data/imgmnt/<fs>/<image_name>`
-
-Where `<fs>` is one of: `ufsmnt`, `exfatmnt`, `pfsmnt`.
+`/mnt/shadowmnt/<image_name>_<hash>`
 
 Image layout requirement (`.ffpkg`, `.exfat`, `.ffpfs`):
 - Game files must be placed at the image root.
@@ -132,7 +130,7 @@ Default scan locations:
 - `/mnt/usb0` .. `/mnt/usb7`
 - `/mnt/ext0`
 - `/mnt/ext1`
-- `/data/imgmnt/ufsmnt`, `/data/imgmnt/exfatmnt`, `/data/imgmnt/pfsmnt` (mounted image content scan)
+- `/mnt/shadowmnt` (mounted image content scan)
 
 You can override scan roots with `scanpath=...` entries in `/data/shadowmount/config.ini`.
 
@@ -231,7 +229,7 @@ If a game is not mounted:
 - Check `/data/shadowmount/debug.log` and system notifications from ShadowMount+.
 - Verify scan roots:
   - if `scanpath=...` is set, only these paths are scanned;
-  - `/data/imgmnt/{ufsmnt,exfatmnt,pfsmnt}` are always scanned.
+  - `/mnt/shadowmnt` is always scanned.
 - Verify scan depth:
   - `recursive_scan=0` scans only first-level subfolders;
   - `recursive_scan=1` scans recursively.
@@ -239,7 +237,7 @@ If a game is not mounted:
 - Verify game structure:
   - folder game: `<GAME_DIR>/sce_sys/param.json`;
   - image game (`.ffpkg` / `.exfat` / `.ffpfs`): `sce_sys/param.json` must be at image root (no extra top-level folder).
-- If you see `missing/invalid param.json` for an image, check via FTP that files are present under `/data/imgmnt/<fs>/<image_name>/` and include `sce_sys/param.json`.
+- If you see `missing/invalid param.json` for an image, check via FTP that files are present under `/mnt/shadowmnt/<image_name>_<hash>/` and include `sce_sys/param.json`.
 - If you see image mount failure, check image integrity and filesystem type (`.ffpkg`=UFS, `.exfat`=exFAT, `.ffpfs`=PFS).
 - If you see duplicate titleId notification, keep only one source per `<TITLE_ID>`.
 
