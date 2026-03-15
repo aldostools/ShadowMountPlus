@@ -234,6 +234,22 @@ static void log_non_empty_scan_paths(void) {
   }
 }
 
+static void ensure_kstuff_noautomount_file(void) {
+  if (access(KSTUFF_NOAUTOMOUNT_FILE, F_OK) == 0)
+    return;
+
+  int fd = open(KSTUFF_NOAUTOMOUNT_FILE, O_RDONLY | O_CREAT, 0666);
+  if (fd >= 0) {
+    close(fd);
+    printf("[KSTUFF] Created startup sentinel: %s\n",
+           KSTUFF_NOAUTOMOUNT_FILE);
+    return;
+  }
+
+  printf("[KSTUFF] Failed to create %s: %s\n", KSTUFF_NOAUTOMOUNT_FILE,
+         strerror(errno));
+}
+
 static void stop_conflicting_backpork(void) {
   if (!runtime_config()->backport_fakelib_enabled)
     return;
@@ -274,6 +290,7 @@ int main(void) {
   install_signal_handlers();
 
   mkdir(LOG_DIR, 0777);
+  ensure_kstuff_noautomount_file();
   existing_pid = find_pid_by_name(PAYLOAD_NAME, true);
   if (existing_pid < 0) {
     printf("[RESTART] Failed to enumerate running processes.\n");

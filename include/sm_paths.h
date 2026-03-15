@@ -8,6 +8,7 @@
 #define LOG_FILE "/data/shadowmount/debug.log"
 #define LOG_FILE_PREV "/data/shadowmount/debug.log.1"
 #define CONFIG_FILE "/data/shadowmount/config.ini"
+#define KSTUFF_NOAUTOMOUNT_FILE "/data/.kstuff_noautomount"
 #define KILL_FILE "/data/shadowmount/STOP"
 #define TOAST_FILE "/data/shadowmount/notify.txt"
 #define NOTIFY_ICON_DIR "/user/data/shadowmount"
