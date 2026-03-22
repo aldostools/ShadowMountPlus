@@ -13,17 +13,13 @@ struct ImageCache {
 static struct ImageCache g_image_cache[MAX_IMAGE_MOUNTS];
 
 static int find_cache_index(const char *path, const char *mount_point) {
-  if ((!path || path[0] == '\0') && (!mount_point || mount_point[0] == '\0'))
-    return -1;
-
   for (int k = 0; k < MAX_IMAGE_MOUNTS; k++) {
     if (!g_image_cache[k].valid)
       continue;
-    if (mount_point && mount_point[0] != '\0' &&
-        strcmp(g_image_cache[k].mount_point, mount_point) == 0) {
+    if (mount_point && strcmp(g_image_cache[k].mount_point, mount_point) == 0) {
       return k;
     }
-    if (path && path[0] != '\0' && strcmp(g_image_cache[k].path, path) == 0)
+    if (path && strcmp(g_image_cache[k].path, path) == 0)
       return k;
   }
 
@@ -71,8 +67,7 @@ bool cache_image_mount(const char *path, const char *mount_point, int unit_id,
 }
 
 bool get_image_cache_entry(int index, image_cache_entry_t *entry_out) {
-  if (!entry_out || index < 0 || index >= MAX_IMAGE_MOUNTS ||
-      !g_image_cache[index].valid) {
+  if (index < 0 || index >= MAX_IMAGE_MOUNTS || !g_image_cache[index].valid) {
     return false;
   }
 
@@ -110,11 +105,11 @@ bool resolve_image_source_from_mount_cache(const char *mount_point,
                                            char *path_out,
                                            size_t path_out_size) {
   int entry_index = find_cache_index(NULL, mount_point);
-  if (entry_index < 0 || !path_out || path_out_size == 0)
+  if (entry_index < 0)
     return false;
   const struct ImageCache *entry = &g_image_cache[entry_index];
 
   path_out[0] = '\0';
   (void)strlcpy(path_out, entry->path, path_out_size);
-  return path_out[0] != '\0';
+  return true;
 }

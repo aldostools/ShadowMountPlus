@@ -43,7 +43,7 @@ bool is_source_stable_for_mount(const char *path, const char *name,
 static bool parse_unit_from_dev_path(const char *dev_path, const char *prefix,
                                      int *unit_out) {
   size_t prefix_len = strlen(prefix);
-  if (!dev_path || strncmp(dev_path, prefix, prefix_len) != 0)
+  if (strncmp(dev_path, prefix, prefix_len) != 0)
     return false;
 
   char *end = NULL;
@@ -58,9 +58,6 @@ static bool parse_unit_from_dev_path(const char *dev_path, const char *prefix,
 
 bool resolve_device_from_mount(const char *mount_point,
                                attach_backend_t *backend_out, int *unit_out) {
-  if (!mount_point || !backend_out || !unit_out)
-    return false;
-
   *backend_out = ATTACH_BACKEND_NONE;
   *unit_out = -1;
 
@@ -106,8 +103,6 @@ bool resolve_device_from_mount(const char *mount_point,
 }
 
 static bool is_path_mountpoint(const char *path) {
-  if (!path || path[0] == '\0')
-    return false;
   struct statfs sfs;
   return (statfs(path, &sfs) == 0 && strcmp(sfs.f_mntonname, path) == 0);
 }

@@ -139,9 +139,6 @@ static bool dispatch_game_launch(int kq, pid_t pid, uint64_t exec_time_us,
 }
 
 static void clear_pending_game_launch(pending_game_launch_t *entry) {
-  if (!entry)
-    return;
-
   memset(entry, 0, sizeof(*entry));
 }
 
@@ -214,8 +211,6 @@ static pending_game_launch_t *queue_pending_game_launch(pid_t pid,
   pending_game_launch_t *entry = find_pending_game_launch(pid);
   if (!entry)
     entry = reserve_pending_game_launch(now_us);
-  if (!entry)
-    return NULL;
 
   if (entry->active && entry->pid != pid) {
     log_debug("  [GAME] replacing pending exec pid=%ld with pid=%ld",
@@ -235,11 +230,7 @@ static void defer_confirmed_game_launch_retry(pid_t pid, uint64_t exec_time_us,
                                               uint64_t now_us,
                                               const char *title_id) {
   clear_all_pending_game_launches();
-  if (!queue_pending_game_launch(pid, exec_time_us, now_us)) {
-    log_debug("  [GAME] failed to defer launch retry for %s pid=%ld", title_id,
-              (long)pid);
-    return;
-  }
+  queue_pending_game_launch(pid, exec_time_us, now_us);
 
   log_debug("  [GAME] deferring launch retry for %s pid=%ld", title_id,
             (long)pid);
@@ -357,9 +348,7 @@ static void handle_game_exec(int kq, pid_t pid) {
   if (!is_process_alive(pid))
     return;
 
-  pending_game_launch_t *entry = queue_pending_game_launch(pid, now_us, now_us);
-  if (!entry)
-    return;
+  queue_pending_game_launch(pid, now_us, now_us);
 }
 
 static void handle_game_exit(pid_t pid) {

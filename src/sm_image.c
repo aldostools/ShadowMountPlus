@@ -38,9 +38,6 @@ static uint32_t get_lvd_sector_size_fallback(image_fs_type_t fs_type) {
 
 static uint32_t get_lvd_sector_size(const char *path, image_fs_type_t fs_type) {
   uint32_t fallback = get_lvd_sector_size_fallback(fs_type);
-  if (!path)
-    return fallback;
-
   struct statfs sfs;
   if (statfs(path, &sfs) != 0)
     return fallback;
@@ -122,9 +119,6 @@ static uint16_t get_lvd_image_type(image_fs_type_t fs_type) {
 }
 
 static uint16_t get_lvd_source_type(const char *path) {
-  if (!path)
-    return LVD_ENTRY_TYPE_FILE;
-
   if (strncmp(path, "/dev/sbram0", strlen("/dev/sbram0")) == 0)
     return LVD_ENTRY_TYPE_SPECIAL;
 

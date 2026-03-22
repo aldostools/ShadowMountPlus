@@ -59,9 +59,6 @@ static void clear_runtime_scan_paths(void) {
 }
 
 static bool add_runtime_scan_path(const char *path) {
-  if (!path)
-    return false;
-
   while (*path && isspace((unsigned char)*path))
     path++;
 

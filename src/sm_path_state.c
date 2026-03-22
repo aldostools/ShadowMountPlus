@@ -41,8 +41,6 @@ static void rebuild_path_state_hash(void) {
 }
 
 static struct PathStateEntry *find_path_state(const char *path) {
-  if (!path || path[0] == '\0')
-    return NULL;
   uint32_t slot = sm_fnv1a32(path) & (STATE_HASH_SIZE - 1u);
   for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
     uint16_t idx = g_path_state_hash[slot];
@@ -57,9 +55,6 @@ static struct PathStateEntry *find_path_state(const char *path) {
 }
 
 static struct PathStateEntry *create_path_state(const char *path) {
-  if (!path || path[0] == '\0')
-    return NULL;
-
   int slot_k = -1;
   for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
     if (!g_path_state[k].valid) {
@@ -123,10 +118,7 @@ static struct PathStateEntry *get_or_create_path_state(const char *path) {
 
 bool load_cached_game_info(const char *path, const struct stat *param_st,
                            char *out_id, char *out_name, bool *valid_out) {
-  if (valid_out)
-    *valid_out = false;
-  if (!path || !param_st)
-    return false;
+  *valid_out = false;
 
   struct PathStateEntry *entry = find_path_state(path);
   if (!entry || !entry->game_info_cached ||
@@ -136,28 +128,19 @@ bool load_cached_game_info(const char *path, const struct stat *param_st,
     return false;
   }
 
-  if (valid_out)
-    *valid_out = entry->game_info_valid;
+  *valid_out = entry->game_info_valid;
   if (!entry->game_info_valid)
     return true;
 
-  if (out_id)
-    (void)strlcpy(out_id, entry->game_title_id, MAX_TITLE_ID);
-  if (out_name)
-    (void)strlcpy(out_name, entry->game_title_name, MAX_TITLE_NAME);
+  (void)strlcpy(out_id, entry->game_title_id, MAX_TITLE_ID);
+  (void)strlcpy(out_name, entry->game_title_name, MAX_TITLE_NAME);
   return true;
 }
 
 void store_cached_game_info(const char *path, const struct stat *param_st,
                             bool valid, const char *title_id,
                             const char *title_name) {
-  if (!path || !param_st)
-    return;
-
   struct PathStateEntry *entry = get_or_create_path_state(path);
-  if (!entry)
-    return;
-
   entry->game_info_cached = true;
   entry->game_info_valid = valid;
   entry->game_info_mtime = param_st->st_mtime;
@@ -195,11 +178,6 @@ void record_missing_param_failure(const char *path) {
     return;
 
   struct PathStateEntry *entry = get_or_create_path_state(path);
-  if (!entry) {
-    log_debug("  [SCAN] missing/invalid param.json: %s", path);
-    notify_system("Missing/invalid param.json:\n%s", path);
-    return;
-  }
   if (entry->missing_param_attempts < UINT8_MAX)
     entry->missing_param_attempts++;
 
@@ -230,8 +208,6 @@ bool is_image_mount_limited(const char *path) {
 
 uint8_t bump_image_mount_attempts(const char *path) {
   struct PathStateEntry *entry = get_or_create_path_state(path);
-  if (!entry)
-    return MAX_IMAGE_MOUNT_ATTEMPTS;
   if (entry->image_mount_attempts < UINT8_MAX)
     entry->image_mount_attempts++;
   if (entry->image_mount_attempts >= MAX_IMAGE_MOUNT_ATTEMPTS &&

@@ -32,11 +32,9 @@ static int extract_json_string(const char *json, const char *key, char *out,
 
 bool get_game_info(const char *base_path, const struct stat *param_st,
                    char *out_id, char *out_name) {
-  if (!out_id || !out_name)
-    return false;
   out_id[0] = '\0';
   out_name[0] = '\0';
-  if (!base_path || !param_st || !S_ISREG(param_st->st_mode))
+  if (!S_ISREG(param_st->st_mode))
     return false;
 
   bool cached_valid = false;
@@ -91,9 +89,6 @@ bool get_game_info(const char *base_path, const struct stat *param_st,
 }
 
 bool directory_has_param_json(const char *dir_path, struct stat *param_st_out) {
-  if (!dir_path || dir_path[0] == '\0')
-    return false;
-
   int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
   if (dir_fd < 0)
     return false;

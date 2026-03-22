@@ -33,8 +33,6 @@ static void rebuild_title_state_hash(void) {
 }
 
 static struct TitleStateEntry *find_title_state(const char *title_id) {
-  if (!title_id || title_id[0] == '\0')
-    return NULL;
   uint32_t slot = sm_fnv1a32(title_id) & (STATE_HASH_SIZE - 1u);
   for (uint32_t i = 0; i < STATE_HASH_SIZE; i++) {
     uint16_t idx = g_title_state_hash[slot];
@@ -49,9 +47,6 @@ static struct TitleStateEntry *find_title_state(const char *title_id) {
 }
 
 static struct TitleStateEntry *create_title_state(const char *title_id) {
-  if (!title_id || title_id[0] == '\0')
-    return NULL;
-
   int slot_k = -1;
   for (int k = 0; k < TITLE_STATE_CAPACITY; k++) {
     if (!g_title_state[k].valid) {
@@ -124,14 +119,14 @@ uint8_t get_register_attempts(const char *title_id) {
 
 void mark_register_attempted(const char *title_id) {
   struct TitleStateEntry *entry = get_or_create_title_state(title_id);
-  if (entry && entry->register_attempts < UINT8_MAX)
+  if (entry->register_attempts < UINT8_MAX)
     entry->register_attempts++;
 }
 
 void notify_duplicate_title_once(const char *title_id, const char *path_a,
                                  const char *path_b) {
   struct TitleStateEntry *entry = get_or_create_title_state(title_id);
-  if (!entry || entry->duplicate_notified_once)
+  if (entry->duplicate_notified_once)
     return;
   entry->duplicate_notified_once = true;
   notify_system("Duplicate %s detected:\n%s\n%s", title_id, path_a, path_b);
@@ -156,8 +151,6 @@ void clear_failed_mount_attempts(const char *title_id) {
 
 uint8_t bump_failed_mount_attempts(const char *title_id) {
   struct TitleStateEntry *entry = get_or_create_title_state(title_id);
-  if (!entry)
-    return MAX_FAILED_MOUNT_ATTEMPTS;
   if (entry->mount_reg_attempts < UINT8_MAX)
     entry->mount_reg_attempts++;
   return entry->mount_reg_attempts;

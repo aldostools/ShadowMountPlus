@@ -27,8 +27,6 @@ static void close_app_db(void) {
 }
 
 static void free_app_db_title_list(struct AppDbTitleList *list) {
-  if (!list)
-    return;
   free(list->ids);
   list->ids = NULL;
   list->count = 0;
@@ -92,9 +90,6 @@ static int app_db_prepare_with_retry(const char *sql, sqlite3_stmt **stmt_out,
 }
 
 int update_snd0info(const char *title_id) {
-  if (!title_id || title_id[0] == '\0')
-    return -1;
-
   if (!g_app_db_stmt_update_snd0) {
     const char *sql =
         "UPDATE tbl_contentinfo "
@@ -168,15 +163,11 @@ static int compare_title_id_str(const void *a, const void *b) {
 
 bool app_db_title_list_contains(const struct AppDbTitleList *list,
                                 const char *title_id) {
-  if (!list || !title_id || title_id[0] == '\0')
-    return false;
   return bsearch(title_id, list->ids, (size_t)list->count, sizeof(*list->ids),
                  compare_title_id_str) != NULL;
 }
 
 static bool load_app_db_title_list(struct AppDbTitleList *list) {
-  if (!list)
-    return false;
   free_app_db_title_list(list);
 
   const char *sql =

@@ -81,9 +81,6 @@ bool find_cached_game(const char *path, const char *title_id,
 }
 
 void clear_cached_game(const char *path) {
-  if (!path || path[0] == '\0')
-    return;
-
   for (int k = 0; k < MAX_PENDING; k++) {
     if (!g_game_cache[k].valid)
       continue;

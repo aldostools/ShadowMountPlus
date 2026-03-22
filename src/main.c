@@ -141,9 +141,6 @@ static void get_firmware_version_string(char out[32]) {
 }
 
 pid_t find_pid_by_name(const char *name, bool exclude_self) {
-  if (!name || name[0] == '\0')
-    return -1;
-
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
   size_t buf_size = 0;
   if (sysctl(mib, 4, NULL, &buf_size, NULL, 0) != 0)
@@ -213,9 +210,6 @@ static bool wait_for_existing_instance_exit(pid_t target_pid) {
 static void log_non_empty_scan_paths(void) {
   for (int i = 0; i < get_scan_path_count(); i++) {
     const char *scan_path = get_scan_path(i);
-    if (!scan_path)
-      continue;
-
     DIR *d = opendir(scan_path);
     if (!d)
       continue;
