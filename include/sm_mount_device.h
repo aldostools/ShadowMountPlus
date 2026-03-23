@@ -10,6 +10,8 @@ const char *attach_backend_name(attach_backend_t backend);
 // Check whether a source path has aged enough to be mounted safely.
 bool is_source_stable_for_mount(const char *path, const char *name,
                                 const char *tag);
+// Wait until a device node appears or disappears.
+bool wait_for_dev_node_state(const char *devname, bool should_exist);
 // Resolve backend and unit ID for a mounted image path.
 bool resolve_device_from_mount(const char *mount_point,
                                attach_backend_t *backend_out, int *unit_out);

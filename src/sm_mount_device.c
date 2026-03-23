@@ -17,7 +17,7 @@ const char *attach_backend_name(attach_backend_t backend) {
 }
 
 // --- Device Node Wait and Source Stability ---
-static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
+bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   for (int i = 0; i < LVD_NODE_WAIT_RETRIES; i++) {
     if ((access(devname, F_OK) == 0) == should_exist)
       return true;

@@ -14,15 +14,6 @@
 #include "sm_path_utils.h"
 #include "sm_paths.h"
 
-static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
-  for (int i = 0; i < LVD_NODE_WAIT_RETRIES; i++) {
-    if ((access(devname, F_OK) == 0) == should_exist)
-      return true;
-    sceKernelUsleep(LVD_NODE_WAIT_US);
-  }
-  return false;
-}
-
 static uint32_t get_lvd_sector_size_fallback(image_fs_type_t fs_type) {
   const runtime_config_t *cfg = runtime_config();
   switch (fs_type) {
