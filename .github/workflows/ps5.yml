@@ -1,0 +1,119 @@
+name: PS5 Build and Release
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Payload
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout pacbrew-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/pacbrew-repo
+          path: pacbrew-repo
+
+      - name: Setup build environment
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            autoconf \
+            automake \
+            build-essential \
+            clang-18 \
+            curl \
+            git \
+            libarchive-tools \
+            libtool \
+            lld-18 \
+            makepkg \
+            meson \
+            pacman-package-manager \
+            pkg-config \
+            xxd \
+            zip
+
+      - name: Build PS5 payload SDK
+        working-directory: pacbrew-repo/sdk
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build PS5 sqlite package
+        working-directory: pacbrew-repo/sqlite
+        run: |
+          makepkg -c -f
+          sudo pacman --noconfirm -U ./ps5-payload-*.pkg.tar.gz
+
+      - name: Build payload
+        run: |
+          make clean all
+
+      - name: Create release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="$(git describe --abbrev=6 --dirty --always --tags 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          archive_name="ShaodMountPlus_${version_tag}.zip"
+
+          zip -9 "${archive_name}" \
+            shadowmountplus.elf \
+            config.ini.example \
+            LICENSE \
+            make_image.bat \
+            mkexfat.sh \
+            mkexfat_macos.sh \
+            mkufs2.sh \
+            New-OsfExfatImage.ps1 \
+            README.md
+
+          echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowmountplus-assets
+          path: |
+            shadowmountplus.elf
+            ${{ steps.package.outputs.archive_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: shadowmountplus-assets
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/shadowmountplus.elf
+            dist/ShaodMountPlus_${{ github.ref_name }}.zip
