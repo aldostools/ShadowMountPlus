@@ -300,6 +300,27 @@ static bool resolve_kstuff_sysentvec_addrs(intptr_t *ps5_out, intptr_t *ps4_out)
     *ps4_out = KERNEL_ADDRESS_DATA_BASE + 0xdba850;
     return true;
 
+  case 0x11000000:
+  case 0x11200000:
+    *ps5_out = KERNEL_ADDRESS_DATA_BASE + 0xdcbc78;
+    *ps4_out = KERNEL_ADDRESS_DATA_BASE + 0xdcbdf0;
+    return true;
+    
+  case 0x11400000:
+  case 0x11600000:
+    *ps5_out = KERNEL_ADDRESS_DATA_BASE + 0xdcbc98;
+    *ps4_out = KERNEL_ADDRESS_DATA_BASE + 0xdcbe10;
+    return true;
+
+  case 0x12000000:
+  case 0x12020000:
+  case 0x12200000:
+  case 0x12400000:
+  case 0x12600000:
+    *ps5_out = KERNEL_ADDRESS_DATA_BASE + 0xdcc978;
+    *ps4_out = KERNEL_ADDRESS_DATA_BASE + 0xdccaf0;
+    return true;
+
   default:
     return false;
   }
