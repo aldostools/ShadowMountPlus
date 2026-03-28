@@ -168,10 +168,6 @@ static existing_directory_result_t handle_existing_directory_candidate(
   }
 
   if (!in_app_db && was_register_attempted(info->title_id)) {
-    uint8_t register_attempts = get_register_attempts(info->title_id);
-    log_debug("  [SKIP] register/install retry limit reached (%u/%u): %s (%s)",
-              (unsigned)register_attempts, (unsigned)MAX_REGISTER_ATTEMPTS,
-              info->title_name, info->title_id);
     return EXISTING_DIRECTORY_HANDLED;
   }
 
