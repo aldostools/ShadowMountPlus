@@ -14,6 +14,7 @@
 #include "sm_mount_device.h"
 #include "sm_filesystem.h"
 #include "sm_image.h"
+#include "sm_path_utils.h"
 #include "sm_scan.h"
 #include "sm_scanner.h"
 #include "sm_install.h"
@@ -32,6 +33,7 @@
 #define RESTART_WAIT_MAX_US 60000000u
 #define KINFO_PID_OFFSET 72
 #define KINFO_TDNAME_OFFSET 447
+#define AUTHID_BASE 0x4801000000000013L
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
@@ -68,7 +70,7 @@ void install_signal_handlers(void) {
 bool should_stop_requested(void) {
   if (g_stop_requested)
     return true;
-  if (access(KILL_FILE, F_OK) == 0) {
+  if (path_exists(KILL_FILE)) {
     remove(KILL_FILE);
     return true;
   }
@@ -252,7 +254,7 @@ static void log_non_empty_scan_paths(void) {
 }
 
 static void ensure_kstuff_noautomount_file(void) {
-  if (access(KSTUFF_NOAUTOMOUNT_FILE, F_OK) == 0)
+  if (path_exists(KSTUFF_NOAUTOMOUNT_FILE))
     return;
 
   int fd = open(KSTUFF_NOAUTOMOUNT_FILE, O_RDONLY | O_CREAT, 0666);
@@ -299,7 +301,7 @@ int main(void) {
 
   sceUserServiceInitialize(0);
   sceAppInstUtilInitialize();
-  kernel_set_ucred_authid(-1, 0x4801000000000013L);
+  kernel_set_ucred_authid(-1, AUTHID_BASE);
   install_signal_handlers();
 
   mkdir(LOG_DIR, 0777);

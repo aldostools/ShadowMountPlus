@@ -9,6 +9,8 @@
 #define LOG_FILE_PREV "/data/shadowmount/debug.log.1"
 #define CONFIG_FILE "/data/shadowmount/config.ini"
 #define AUTOTUNE_FILE "/data/shadowmount/autotune.ini"
+#define APPMETA_BASE "/user/appmeta"
+#define APP_BASE "/user/app"
 #define KSTUFF_NOAUTOMOUNT_FILE "/data/.kstuff_noautomount"
 #define KILL_FILE "/data/shadowmount/STOP"
 #define TOAST_FILE "/data/shadowmount/notify.txt"

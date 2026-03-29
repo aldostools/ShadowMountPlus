@@ -858,7 +858,7 @@ void cleanup_stale_image_mounts(void) {
     if (!get_image_cache_entry(k, &cached_entry))
       continue;
 
-    if (access(cached_entry.path, F_OK) != 0) {
+    if (!path_exists(cached_entry.path)) {
       log_debug("  [IMG][%s] Source removed, unmounting: %s",
                 attach_backend_name(cached_entry.backend), cached_entry.path);
       if (unmount_image(cached_entry.path, cached_entry.unit_id,
@@ -906,7 +906,7 @@ void cleanup_stale_image_mounts_for_root(const char *root) {
       continue;
     }
 
-    if (access(cached_entry.path, F_OK) != 0) {
+    if (!path_exists(cached_entry.path)) {
       log_debug("  [IMG][%s] Source removed, unmounting: %s",
                 attach_backend_name(cached_entry.backend), cached_entry.path);
       if (unmount_image(cached_entry.path, cached_entry.unit_id,

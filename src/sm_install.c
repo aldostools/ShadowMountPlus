@@ -10,6 +10,7 @@
 #include "sm_appdb.h"
 #include "sm_title_state.h"
 #include "sm_image_cache.h"
+#include "sm_paths.h"
 
 static bool write_link_file(const char *path, const char *value) {
   FILE *f = fopen(path, "w");
@@ -34,17 +35,73 @@ static bool write_link_file(const char *path, const char *value) {
   return true;
 }
 
+static bool is_appmeta_file(const char *name) {
+  if (!name)
+    return false;
+  if (strcasecmp(name, "param.json") == 0 || strcasecmp(name, "param.sfo") == 0)
+    return true;
+
+  const char *ext = strrchr(name, '.');
+  if (!ext)
+    return false;
+
+  return (strcasecmp(ext, ".png") == 0 || strcasecmp(ext, ".dds") == 0 ||
+          strcasecmp(ext, ".at9") == 0);
+}
+
+static bool copy_sce_sys_to_appmeta(const char *src_sce_sys,
+                                    const char *user_appmeta_dir) {
+  DIR *d = opendir(src_sce_sys);
+  if (!d)
+    return false;
+
+  bool ok = true;
+  struct dirent *e;
+  char src_path[MAX_PATH];
+  char dst_path[MAX_PATH];
+  struct stat st;
+  while ((e = readdir(d)) != NULL) {
+    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+      continue;
+    if (!is_appmeta_file(e->d_name))
+      continue;
+
+    snprintf(src_path, sizeof(src_path), "%s/%s", src_sce_sys, e->d_name);
+    if (stat(src_path, &st) != 0 || !S_ISREG(st.st_mode))
+      continue;
+
+    snprintf(dst_path, sizeof(dst_path), "%s/%s", user_appmeta_dir, e->d_name);
+    if (copy_file(src_path, dst_path) != 0) {
+      ok = false;
+      break;
+    }
+  }
+
+  if (closedir(d) != 0)
+    ok = false;
+  return ok;
+}
+
 // --- Install/Remount Action ---
 static bool mount_and_install(const char *src_path, const char *title_id,
                               const char *title_name, bool is_remount,
                               bool should_register) {
+  char user_appmeta_dir[MAX_PATH];
   char user_app_dir[MAX_PATH];
   char user_sce_sys[MAX_PATH];
   char src_sce_sys[MAX_PATH];
+  char src_snd0[MAX_PATH];
   char image_source_path[MAX_PATH];
   bool has_image_source = false;
+  bool appmeta_missing = false;
+  bool metadata_restaged = false;
+  bool restage_staging = false;
+  bool restage_appmeta = false;
+  bool has_src_snd0 = false;
 
-  snprintf(user_app_dir, sizeof(user_app_dir), "/user/app/%s", title_id);
+  snprintf(user_appmeta_dir, sizeof(user_appmeta_dir), "%s/%s", APPMETA_BASE,
+           title_id);
+  snprintf(user_app_dir, sizeof(user_app_dir), "%s/%s", APP_BASE, title_id);
 
   if (is_under_image_mount_base(src_path)) {
     has_image_source = resolve_image_source_from_mount_cache(
@@ -55,32 +112,66 @@ static bool mount_and_install(const char *src_path, const char *title_id,
     }
   }
 
+  appmeta_missing = !has_appmeta_data(title_id);
+  if (is_remount && appmeta_missing) {
+    log_debug("  [REG] appmeta missing, restaging metadata only: %s", title_id);
+  }
+
+  restage_staging = (!is_remount || should_register);
+  restage_appmeta = (!is_remount || appmeta_missing);
+
   // COPY FILES
-  if (!is_remount) {
-    snprintf(user_sce_sys, sizeof(user_sce_sys), "%s/sce_sys", user_app_dir);
-    mkdir(user_app_dir, 0777);
-    mkdir(user_sce_sys, 0777);
-
+  if (restage_staging || restage_appmeta) {
     snprintf(src_sce_sys, sizeof(src_sce_sys), "%s/sce_sys", src_path);
-    if (copy_dir(src_sce_sys, user_sce_sys) != 0) {
-      log_debug("  [COPY] Failed to copy sce_sys: %s -> %s", src_sce_sys,
-                user_sce_sys);
-      return false;
-    }
-
-    char icon_src[MAX_PATH], icon_dst[MAX_PATH];
-    snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", src_path);
-    snprintf(icon_dst, sizeof(icon_dst), "/user/app/%s/icon0.png", title_id);
-    if (copy_file(icon_src, icon_dst) != 0) {
-      log_debug("  [COPY] Failed to copy icon: %s -> %s", icon_src, icon_dst);
-      return false;
-    }
+    snprintf(src_snd0, sizeof(src_snd0), "%s/snd0.at9", src_sce_sys);
+    has_src_snd0 = path_exists(src_snd0);
   } else {
     log_debug("  [SPEED] Skipping file copy (Assets already exist)");
   }
 
+  if (restage_staging) {
+    mkdir(APP_BASE, 0777);
+    mkdir(user_app_dir, 0777);
+    snprintf(user_sce_sys, sizeof(user_sce_sys), "%s/sce_sys", user_app_dir);
+    mkdir(user_sce_sys, 0777);
+    if (copy_dir(src_sce_sys, user_sce_sys) != 0) {
+      log_debug("  [COPY] Failed to copy sce_sys staging: %s -> %s", src_sce_sys,
+                user_sce_sys);
+      return false;
+    }
+
+    char icon_src[MAX_PATH];
+    char icon_dst[MAX_PATH];
+    snprintf(icon_src, sizeof(icon_src), "%s/icon0.png", src_sce_sys);
+    snprintf(icon_dst, sizeof(icon_dst), "%s/icon0.png", user_app_dir);
+    if (copy_file(icon_src, icon_dst) != 0) {
+      log_debug("  [COPY] Failed to copy staged icon: %s -> %s", icon_src,
+                icon_dst);
+      return false;
+    }
+  }
+
+  if (restage_appmeta) {
+    mkdir(APPMETA_BASE, 0777);
+    mkdir(user_appmeta_dir, 0777);
+    if (!copy_sce_sys_to_appmeta(src_sce_sys, user_appmeta_dir)) {
+      log_debug("  [COPY] Failed to copy appmeta files: %s -> %s", src_sce_sys,
+                user_appmeta_dir);
+      return false;
+    }
+    metadata_restaged = true;
+  }
+
+  if (!mount_title_nullfs(title_id, src_path)) {
+    log_debug("  [LINK] nullfs mount failed: title=%s src=%s", title_id,
+              src_path);
+    return false;
+  }
+
   // WRITE TRACKER
   char lnk_path[MAX_PATH];
+  mkdir(APP_BASE, 0777);
+  mkdir(user_app_dir, 0777);
   snprintf(lnk_path, sizeof(lnk_path), "%s/mount.lnk", user_app_dir);
   if (!write_link_file(lnk_path, src_path))
     return false;
@@ -104,25 +195,25 @@ static bool mount_and_install(const char *src_path, const char *title_id,
               strerror(errno));
   }
 
-  if (!mount_title_nullfs(title_id, src_path)) {
-    log_debug("  [LINK] mount.lnk created but nullfs mount failed: title=%s "
-              "src=%s",
-              title_id, src_path);
-    return false;
-  }
-
   if (!should_register) {
+    if (metadata_restaged && has_src_snd0) {
+      int snd0_updates = update_snd0info(title_id);
+      if (snd0_updates >= 0)
+        log_debug("  [DB] snd0info force-updated after appmeta refresh rows=%d",
+                  snd0_updates);
+    }
     log_debug("  [REG] Skip (already present in app.db)");
     return true;
   }
 
   // REGISTER
-  char src_snd0[MAX_PATH];
-  snprintf(src_snd0, sizeof(src_snd0), "%s/sce_sys/snd0.at9", src_path);
-  bool has_src_snd0 = (access(src_snd0, F_OK) == 0);
+  if (!metadata_restaged) {
+    snprintf(src_snd0, sizeof(src_snd0), "%s/sce_sys/snd0.at9", src_path);
+    has_src_snd0 = path_exists(src_snd0);
+  }
 
   mark_register_attempted(title_id);
-  int res = sceAppInstUtilAppInstallTitleDir(title_id, "/user/app/", 0);
+  int res = sceAppInstUtilAppInstallTitleDir(title_id, APP_BASE "/", 0);
   sceKernelUsleep(200000);
 
   if (res == 0) {

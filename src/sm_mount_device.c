@@ -6,6 +6,7 @@
 #include "sm_log.h"
 #include "sm_config_mount.h"
 #include "sm_mount_defs.h"
+#include "sm_path_utils.h"
 #include "sm_stability.h"
 
 const char *attach_backend_name(attach_backend_t backend) {
@@ -19,7 +20,7 @@ const char *attach_backend_name(attach_backend_t backend) {
 // --- Device Node Wait and Source Stability ---
 bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   for (int i = 0; i < LVD_NODE_WAIT_RETRIES; i++) {
-    if ((access(devname, F_OK) == 0) == should_exist)
+    if (path_exists(devname) == should_exist)
       return true;
     sceKernelUsleep(LVD_NODE_WAIT_US);
   }

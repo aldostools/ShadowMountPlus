@@ -12,15 +12,23 @@
 // --- FILESYSTEM ---
 bool is_installed(const char *title_id) {
   char path[MAX_PATH];
-  snprintf(path, sizeof(path), "/user/app/%s", title_id);
+  snprintf(path, sizeof(path), "%s/%s", APP_BASE, title_id);
   struct stat st;
   return (stat(path, &st) == 0);
 }
+
+bool has_appmeta_data(const char *title_id) {
+  char path[MAX_PATH];
+  snprintf(path, sizeof(path), "%s/%s/param.json", APPMETA_BASE, title_id);
+  struct stat st;
+  return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
 bool is_data_mounted(const char *title_id) {
   char path[MAX_PATH];
   snprintf(path, sizeof(path), "/system_ex/app/%s/sce_sys/param.json",
            title_id);
-  return (access(path, F_OK) == 0);
+  return path_exists(path);
 }
 
 static bool read_mount_link_file(const char *lnk_path, char *out,
@@ -47,7 +55,7 @@ static bool read_mount_link_file(const char *lnk_path, char *out,
 
 static void build_title_link_path(const char *title_id, const char *filename,
                                   char out[MAX_PATH]) {
-  snprintf(out, MAX_PATH, "/user/app/%s/%s", title_id, filename);
+  snprintf(out, MAX_PATH, "%s/%s/%s", APP_BASE, title_id, filename);
 }
 
 typedef struct {
@@ -71,10 +79,10 @@ typedef bool (*title_app_dir_iter_fn)(const char *title_id,
 static void for_each_title_app_dir(const char *open_error_context,
                                    bool stop_on_signal,
                                    title_app_dir_iter_fn fn, void *ctx) {
-  DIR *d = opendir("/user/app");
+  DIR *d = opendir(APP_BASE);
   if (!d) {
     if (errno != ENOENT)
-      log_debug("  [LINK] open /user/app failed%s: %s",
+      log_debug("  [LINK] open %s failed%s: %s", APP_BASE,
                 open_error_context ? open_error_context : "", strerror(errno));
     return;
   }
@@ -122,7 +130,7 @@ bool resolve_title_app_dir(const struct dirent *entry, char *app_dir,
     path_size = app_dir_size;
   }
 
-  int written = snprintf(path, path_size, "/user/app/%s", entry->d_name);
+  int written = snprintf(path, path_size, "%s/%s", APP_BASE, entry->d_name);
   if (written < 0 || (size_t)written >= path_size) {
     if (app_dir && app_dir_size > 0)
       app_dir[0] = '\0';
@@ -146,18 +154,18 @@ static bool source_path_needs_cleanup(const char *source_path,
     char image_source_path[MAX_PATH];
     bool has_image_source = resolve_image_source_from_mount_cache(
         source_path, image_source_path, sizeof(image_source_path));
-    if (has_image_source && access(image_source_path, F_OK) != 0)
+    if (has_image_source && !path_exists(image_source_path))
       return true;
   }
 
-  if (access(source_path, F_OK) != 0)
+  if (!path_exists(source_path))
     return true;
   if (path_matches_root_or_child(source_path, "/system_ex/app"))
     return true;
 
   char eboot_path[MAX_PATH];
   snprintf(eboot_path, sizeof(eboot_path), "%s/eboot.bin", source_path);
-  if (access(eboot_path, F_OK) == 0)
+  if (path_exists(eboot_path))
     return false;
 
   if (!*tried_image_recovery && is_under_image_mount_base(source_path)) {
@@ -165,7 +173,7 @@ static bool source_path_needs_cleanup(const char *source_path,
     *tried_image_recovery = true;
   }
 
-  return access(eboot_path, F_OK) != 0;
+  return !path_exists(eboot_path);
 }
 
 static bool resolve_mount_image_source_path(const title_link_paths_t *paths,
@@ -759,7 +767,7 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
               title_id, src_path, (unsigned)(src_st.st_mode & 077777));
     return false;
   }
-  if (access(src_eboot, F_OK) != 0) {
+  if (!path_exists(src_eboot)) {
     bool tried_image_recovery = false;
     if (source_path_needs_cleanup(src_path, &tried_image_recovery)) {
       log_debug("  [LINK] source eboot.bin missing for %s: %s", title_id,
@@ -777,7 +785,7 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
   if (state.mounted) {
     if (state.has_our_nullfs &&
         (state.top_is_our_nullfs || state.has_our_backport) &&
-        access(dst_eboot, F_OK) == 0) {
+        path_exists(dst_eboot)) {
       log_debug("  [LINK] mount stack already active: %s -> %s", src_path, dst);
       return true;
     }
@@ -820,7 +828,7 @@ bool mount_title_nullfs(const char *title_id, const char *src_path) {
     return false;
   }
 
-  if (access(dst_eboot, F_OK) != 0) {
+  if (!path_exists(dst_eboot)) {
     log_debug("  [LINK] mounted nullfs but eboot.bin is missing at target: %s",
               dst_eboot);
     if (unmount(dst, 0) != 0 && errno != ENOENT && errno != EINVAL) {
@@ -880,11 +888,11 @@ static bool cleanup_mount_links_entry(const char *title_id,
                                       ctx->removed_source_root));
       if (!matches_removed_source)
         return true;
-      should_remove = (has_image_source && access(image_source_path, F_OK) != 0) ||
+      should_remove = (has_image_source && !path_exists(image_source_path)) ||
                       source_path_needs_cleanup(source_path,
                                                 &ctx->tried_image_recovery);
     } else {
-      should_remove = (has_image_source && access(image_source_path, F_OK) != 0) ||
+      should_remove = (has_image_source && !path_exists(image_source_path)) ||
                       source_path_needs_cleanup(source_path,
                                                 &ctx->tried_image_recovery);
     }

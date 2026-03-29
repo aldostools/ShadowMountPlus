@@ -114,7 +114,7 @@ void prune_game_cache(void) {
   for (int k = 0; k < MAX_PENDING; k++) {
     if (!g_game_cache[k].valid)
       continue;
-    if (access(g_game_cache[k].path, F_OK) == 0)
+    if (path_exists(g_game_cache[k].path))
       continue;
     clear_game_cache_slot(k, "source removed");
   }
@@ -135,7 +135,7 @@ void prune_game_cache_for_root(const char *root) {
             : g_game_cache[k].path;
     if (!path_matches_root_or_child(entry_root, root))
       continue;
-    if (access(g_game_cache[k].path, F_OK) == 0)
+    if (path_exists(g_game_cache[k].path))
       continue;
     clear_game_cache_slot(k, "source removed");
   }

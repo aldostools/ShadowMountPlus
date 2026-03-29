@@ -20,11 +20,34 @@
 
 typedef struct {
   char discovered_param_roots[MAX_PENDING][MAX_PATH];
+  char checked_appmeta_titles[MAX_PENDING][MAX_TITLE_ID];
+  bool checked_appmeta_present[MAX_PENDING];
+  int checked_appmeta_count;
 } scan_workspace_t;
 
 // Reuse the largest transient scan buffer instead of placing ~512 KiB of path
 // state on the stack each cycle.
 static scan_workspace_t g_scan_workspace;
+
+static void reset_scan_workspace(void) {
+  g_scan_workspace.checked_appmeta_count = 0;
+}
+
+static bool get_appmeta_present_for_scan_cycle(const char *title_id) {
+  for (int i = 0; i < g_scan_workspace.checked_appmeta_count; i++) {
+    if (strcmp(g_scan_workspace.checked_appmeta_titles[i], title_id) == 0)
+      return g_scan_workspace.checked_appmeta_present[i];
+  }
+
+  bool present = has_appmeta_data(title_id);
+  if (g_scan_workspace.checked_appmeta_count < MAX_PENDING) {
+    int slot = g_scan_workspace.checked_appmeta_count++;
+    (void)strlcpy(g_scan_workspace.checked_appmeta_titles[slot], title_id,
+                  sizeof(g_scan_workspace.checked_appmeta_titles[slot]));
+    g_scan_workspace.checked_appmeta_present[slot] = present;
+  }
+  return present;
+}
 
 static bool is_under_discovered_param_root(
     const char *path, char discovered_param_roots[][MAX_PATH],
@@ -147,6 +170,8 @@ static existing_directory_result_t handle_existing_directory_candidate(
 
   bool in_app_db = app_db_title_list_contains(app_db_titles, info->title_id);
   bool installed = in_app_db && is_installed(info->title_id);
+  bool appmeta_present =
+      installed ? get_appmeta_present_for_scan_cycle(info->title_id) : false;
   link_matches_source = installed && link_matches_source;
   bool source_valid = false;
   if (link_matches_source) {
@@ -155,12 +180,13 @@ static existing_directory_result_t handle_existing_directory_candidate(
       source_valid = is_data_mounted(info->title_id);
   }
 
-  if (source_valid) {
+  if (source_valid && appmeta_present) {
     cache_game_entry(full_path, info->title_id, info->title_name);
     return EXISTING_DIRECTORY_PREFER_CURRENT;
   }
 
-  if (installed && has_tracked_path && strcmp(tracked_path, full_path) != 0 &&
+  if (installed && appmeta_present && has_tracked_path &&
+      strcmp(tracked_path, full_path) != 0 &&
       is_data_mounted(info->title_id)) {
     (void)strlcpy(preferred_existing_path_out, tracked_path, MAX_PATH);
     cache_game_entry(tracked_path, info->title_id, info->title_name);
@@ -459,6 +485,7 @@ int collect_scan_candidates_for_scan_root(const char *scan_root,
                                           int max_candidates,
                                           int *total_found_out,
                                           bool *unstable_found_out) {
+  reset_scan_workspace();
   int candidate_count = 0;
   const struct AppDbTitleList *app_db_titles = NULL;
   bool app_db_titles_ready = get_app_db_title_list_cached(&app_db_titles);
@@ -482,6 +509,7 @@ int collect_scan_candidates_for_scan_root(const char *scan_root,
 int collect_scan_candidates(scan_candidate_t *candidates, int max_candidates,
                             int *total_found_out,
                             bool *unstable_found_out) {
+  reset_scan_workspace();
   int candidate_count = 0;
   const struct AppDbTitleList *app_db_titles = NULL;
   bool app_db_titles_ready = get_app_db_title_list_cached(&app_db_titles);

@@ -68,7 +68,7 @@ static struct PathStateEntry *create_path_state(const char *path) {
     for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
       if (!g_path_state[k].valid)
         continue;
-      if (access(g_path_state[k].path, F_OK) != 0) {
+      if (!path_exists(g_path_state[k].path)) {
         evict_k = k;
         break;
       }
@@ -156,7 +156,7 @@ void prune_path_state(void) {
   for (int k = 0; k < PATH_STATE_CAPACITY; k++) {
     if (!g_path_state[k].valid || g_path_state[k].path[0] == '\0')
       continue;
-    if (access(g_path_state[k].path, F_OK) == 0)
+    if (path_exists(g_path_state[k].path))
       continue;
     memset(&g_path_state[k], 0, sizeof(g_path_state[k]));
     changed = true;
@@ -177,7 +177,7 @@ void prune_path_state_for_root(const char *root) {
       continue;
     if (!path_matches_root_or_child(g_path_state[k].path, root))
       continue;
-    if (access(g_path_state[k].path, F_OK) == 0)
+    if (path_exists(g_path_state[k].path))
       continue;
     memset(&g_path_state[k], 0, sizeof(g_path_state[k]));
     changed = true;

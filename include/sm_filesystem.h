@@ -7,11 +7,13 @@
 
 // Check whether a title is present in the installed app set.
 bool is_installed(const char *title_id);
+// Check whether /user/appmeta/<TITLE_ID>/param.json exists.
+bool has_appmeta_data(const char *title_id);
 // Check whether a title currently has mounted data.
 bool is_data_mounted(const char *title_id);
-// Read the mount.lnk source path for an installed title.
+// Read the mount.lnk source path for a title tracked under /user/app.
 bool read_mount_link(const char *title_id, char *out, size_t out_size);
-// Validate a /user/app/<TITLE_ID> entry and optionally build its path.
+// Validate a /user/app/<TITLE_ID> tracker entry and optionally build its path.
 bool resolve_title_app_dir(const struct dirent *entry, char *app_dir,
                            size_t app_dir_size);
 // Recover staged mount links and warm image source mappings on startup.
