@@ -14,6 +14,8 @@
 #define KSTUFF_SYSENTVEC_TOGGLE_OFFSET 14
 #define KSTUFF_SYSENTVEC_ENABLED 0xdeb7u
 #define KSTUFF_SYSENTVEC_DISABLED 0xffffu
+#define KSTUFF_CRASH_HEURISTIC_MAX_RUNTIME_US (120ull * 1000000ull)
+#define KSTUFF_CRASH_HEURISTIC_APPFOCUS_TO_LNC_WINDOW_US (2ull * 1000000ull)
 typedef struct {
   bool active;
   bool image_backed;
@@ -24,6 +26,7 @@ typedef struct {
   uint32_t app_id;
   uint32_t autopause_delay_seconds;
   uint64_t launch_time_us;
+  uint64_t auto_pause_time_us;
   uint64_t pause_deadline_us;
   char title_id[MAX_TITLE_ID];
 } kstuff_game_entry_t;
@@ -44,6 +47,13 @@ static kstuff_state_t g_kstuff;
 static _Atomic uint32_t g_pending_app_focus_id;
 static _Atomic bool g_pending_app_focus_valid;
 static _Atomic bool g_pending_config_reload;
+static _Atomic uint64_t g_last_relevant_app_focus_time_us;
+static _Atomic bool g_crash_sequence_seen_since_launch;
+
+static bool should_log_kstuff_crash_heuristic(const kstuff_game_entry_t *entry,
+                                              uint64_t exit_time_us,
+                                              uint64_t *elapsed_us_out);
+static bool is_ignored_focus_app_id(uint32_t app_id);
 
 static bool refresh_kstuff_support_state(void);
 static uint32_t get_pause_delay_seconds_for_title(const char *title_id,
@@ -544,6 +554,7 @@ static void maybe_apply_kstuff_pause_for_slot(kstuff_game_entry_t *entry) {
 
   if (was_enabled) {
     mark_restore_needed();
+    entry->auto_pause_time_us = now_us;
     log_debug("  [KSTUFF] auto-paused for %s pid=%ld (%s launch)",
               entry->title_id, (long)entry->pid,
               entry->image_backed ? "image" : "direct");
@@ -748,9 +759,12 @@ void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
   g_kstuff.game.app_id = app_id;
   g_kstuff.game.autopause_delay_seconds = autopause_delay_seconds;
   g_kstuff.game.launch_time_us = base_time_us;
+  g_kstuff.game.auto_pause_time_us = 0;
   g_kstuff.game.pause_deadline_us =
       base_time_us == 0 ? 0 : base_time_us + (uint64_t)delay_seconds * 1000000ull;
   (void)strlcpy(g_kstuff.game.title_id, title_id, sizeof(g_kstuff.game.title_id));
+  atomic_store(&g_last_relevant_app_focus_time_us, 0);
+  atomic_store(&g_crash_sequence_seen_since_launch, false);
 
   log_debug("  [KSTUFF] tracking game launch: %s pid=%ld app_id=0x%08X source=%s "
             "pause_delay=%us", title_id, (long)pid, app_id,
@@ -758,8 +772,28 @@ void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
 }
 
 void sm_kstuff_note_app_focus(uint32_t app_id) {
+  if (g_kstuff.game.active && !is_ignored_focus_app_id(app_id))
+    atomic_store(&g_last_relevant_app_focus_time_us, monotonic_time_us());
   atomic_store(&g_pending_app_focus_id, app_id);
   atomic_store(&g_pending_app_focus_valid, true);
+}
+
+void sm_kstuff_note_lnc_system_status(uint64_t pattern) {
+  if (pattern != 0x0000000000000002ULL) // SHELLUI_FG_GAME_BG_CPU_MODE
+    return;
+  if (!g_kstuff.game.active)
+    return;
+
+  uint64_t app_focus_time_us = atomic_load(&g_last_relevant_app_focus_time_us);
+  uint64_t now_us = monotonic_time_us();
+  if (app_focus_time_us == 0 || now_us == 0 || now_us < app_focus_time_us)
+    return;
+  if (now_us - app_focus_time_us >
+      KSTUFF_CRASH_HEURISTIC_APPFOCUS_TO_LNC_WINDOW_US) {
+    return;
+  }
+
+  atomic_store(&g_crash_sequence_seen_since_launch, true);
 }
 
 void sm_kstuff_game_on_exit(pid_t pid) {
@@ -767,9 +801,18 @@ void sm_kstuff_game_on_exit(pid_t pid) {
     return;
 
   bool restore_needed = tracked_game_requires_restore();
+  uint64_t elapsed_us = 0;
+  if (should_log_kstuff_crash_heuristic(&g_kstuff.game, monotonic_time_us(),
+                                        &elapsed_us)) {
+    log_debug("  [GAME] detected app crash after kstuff auto-pause: "
+              "%s %us after launch",
+              g_kstuff.game.title_id, (unsigned)(elapsed_us / 1000000ull));
+  }
   log_debug("  [KSTUFF] game stopped: %s pid=%ld",
             g_kstuff.game.title_id, (long)pid);
   memset(&g_kstuff.game, 0, sizeof(g_kstuff.game));
+  atomic_store(&g_last_relevant_app_focus_time_us, 0);
+  atomic_store(&g_crash_sequence_seen_since_launch, false);
   if (restore_needed)
     finish_tracked_game_clear("tracked game exit");
 }
@@ -805,6 +848,8 @@ void sm_kstuff_init(void) {
   atomic_store(&g_pending_app_focus_id, 0);
   atomic_store(&g_pending_app_focus_valid, false);
   atomic_store(&g_pending_config_reload, false);
+  atomic_store(&g_last_relevant_app_focus_time_us, 0);
+  atomic_store(&g_crash_sequence_seen_since_launch, false);
 
   if (!resolve_kstuff_sysentvec_addrs(&g_kstuff.sysentvec_ps5,
                                       &g_kstuff.sysentvec_ps4)) {
@@ -831,5 +876,40 @@ void sm_kstuff_shutdown(void) {
   atomic_store(&g_pending_app_focus_id, 0);
   atomic_store(&g_pending_app_focus_valid, false);
   atomic_store(&g_pending_config_reload, false);
+  atomic_store(&g_last_relevant_app_focus_time_us, 0);
+  atomic_store(&g_crash_sequence_seen_since_launch, false);
   memset(&g_kstuff, 0, sizeof(g_kstuff));
+}
+
+static bool should_log_kstuff_crash_heuristic(const kstuff_game_entry_t *entry,
+                                              uint64_t exit_time_us,
+                                              uint64_t *elapsed_us_out) {
+  if (elapsed_us_out)
+    *elapsed_us_out = 0;
+  if (!entry || !entry->active || entry->launch_time_us == 0 || exit_time_us == 0)
+    return false;
+  if (exit_time_us <= entry->launch_time_us)
+    return false;
+
+  uint64_t elapsed_us = exit_time_us - entry->launch_time_us;
+  if (elapsed_us >= KSTUFF_CRASH_HEURISTIC_MAX_RUNTIME_US)
+    return false;
+  if (entry->auto_pause_time_us == 0 || entry->auto_pause_time_us < entry->launch_time_us ||
+      entry->auto_pause_time_us > exit_time_us) {
+    return false;
+  }
+  if (!atomic_load(&g_crash_sequence_seen_since_launch)) {
+    return false;
+  }
+
+  if (elapsed_us_out)
+    *elapsed_us_out = elapsed_us;
+  return true;
+}
+
+static bool is_ignored_focus_app_id(uint32_t app_id) {
+  if (app_id == 0)
+    return true;
+  return g_kstuff.game.active && g_kstuff.game.app_id != 0 &&
+         app_id == g_kstuff.game.app_id;
 }

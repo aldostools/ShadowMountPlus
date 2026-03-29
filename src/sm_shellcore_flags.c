@@ -24,6 +24,7 @@ typedef struct {
   sm_kernel_event_flag_t handle;
   uint64_t last_pattern;
   int last_rc;
+  bool required;
   bool is_open;
   bool has_last_pattern;
   bool has_last_rc;
@@ -34,13 +35,17 @@ typedef struct {
   const char *name;
 } shellcore_flag_bit_desc_t;
 
+static const shellcore_flag_bit_desc_t g_lnc_util_system_status_bits[] = {
+    {0x0000000000000001ULL, "EXTRA_AUDIO_CPU_BUDGET_AVAILABLE"},
+    {0x0000000000000002ULL, "SHELLUI_FG_GAME_BG_CPU_MODE"},
+};
+
 static shellcore_flag_monitor_t g_shellcore_flags[] = {
-    {.name = "SceShellCoreUtilAppFocus", .handle = -1},
-    {.name = "SceSystemStateMgrInfo", .handle = -1},
+    {.name = "SceShellCoreUtilAppFocus", .handle = -1, .required = true},
+    {.name = "SceSystemStateMgrInfo", .handle = -1, .required = true},
+    {.name = "SceLncUtilSystemStatus", .handle = -1, .required = false},
 /*    {.name = "SceSystemStateMgrStatus", .handle = -1},
     {.name = "SceSysCoreSuspend", .handle = -1},
-    {.name = "SceLncUtilSystemStatus", .handle = -1},
-    {.name = "SceShellCoreUtilCtrlFocus", .handle = -1},
     {.name = "SceShellCoreUtilPowerControl", .handle = -1},
     {.name = "SceShellCoreUtilRunLevel", .handle = -1},
     {.name = "SceShellCoreUtilUIStatus", .handle = -1},
@@ -60,11 +65,6 @@ static bool g_shellcore_flag_start_success = false;
 static volatile sig_atomic_t g_shellcore_flag_stop_requested = 0;
 
 #if 0
-static const shellcore_flag_bit_desc_t g_lnc_util_system_status_bits[] = {
-    {0x0000000000000001ULL, "EXTRA_AUDIO_CPU_BUDGET_AVAILABLE"},
-    {0x0000000000000002ULL, "SHELLUI_FG_GAME_BG_CPU_MODE"},
-};
-
 static const shellcore_flag_bit_desc_t g_power_control_bits[] = {
     {0x0000000000020000ULL, "SCREEN_SAVER_ON"},
     {0x0000000000040000ULL, "POWER_TRANSITION"},
@@ -167,7 +167,6 @@ static const shellcore_flag_bit_desc_t *get_shellcore_flag_bits(
   if (!flag || !flag->name)
     return NULL;
 
-#if 0
   if (strcmp(flag->name, "SceLncUtilSystemStatus") == 0) {
     if (count_out) {
       *count_out = sizeof(g_lnc_util_system_status_bits) /
@@ -176,6 +175,7 @@ static const shellcore_flag_bit_desc_t *get_shellcore_flag_bits(
     return g_lnc_util_system_status_bits;
   }
 
+#if 0
   if (strcmp(flag->name, "SceShellCoreUtilPowerControl") == 0) {
     if (count_out)
       *count_out = sizeof(g_power_control_bits) / sizeof(g_power_control_bits[0]);
@@ -560,13 +560,20 @@ static void close_shellcore_flags(void) {
   }
 }
 
-static size_t open_shellcore_flags(void) {
+static bool open_shellcore_flags(size_t *opened_count_out) {
   size_t opened_count = 0;
+  size_t required_count = 0;
+  size_t required_opened = 0;
+
+  if (opened_count_out)
+    *opened_count_out = 0;
 
   for (size_t i = 0; i < sizeof(g_shellcore_flags) / sizeof(g_shellcore_flags[0]);
        ++i) {
     shellcore_flag_monitor_t *flag = &g_shellcore_flags[i];
     sm_kernel_event_flag_t handle = -1;
+    if (flag->required)
+      required_count++;
     int rc = sceKernelOpenEventFlag(&handle, flag->name);
     if (rc < 0) {
       log_debug("  [SHELLFLAG] open failed: %s rc=0x%08X", flag->name,
@@ -577,6 +584,8 @@ static size_t open_shellcore_flags(void) {
 
     flag->handle = handle;
     flag->is_open = true;
+    if (flag->required)
+      required_opened++;
     log_debug("  [SHELLFLAG] opened %s handle=0x%016llX", flag->name,
               (unsigned long long)flag->handle);
 
@@ -591,7 +600,9 @@ static size_t open_shellcore_flags(void) {
     opened_count++;
   }
 
-  return opened_count;
+  if (opened_count_out)
+    *opened_count_out = opened_count;
+  return required_opened == required_count;
 }
 
 static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
@@ -650,6 +661,8 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
     sm_kstuff_note_app_focus((uint32_t)result_pattern);
     wake_game_lifecycle_watcher();
   }
+  if (strcmp(flag->name, "SceLncUtilSystemStatus") == 0)
+    sm_kstuff_note_lnc_system_status(result_pattern);
   if (entered_shutdown_on_going) {
     request_shutdown_stop("SceSystemStateMgrInfo=SHUTDOWN_ON_GOING");
   }
@@ -661,10 +674,8 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
 static void *shellcore_flag_thread_main(void *arg) {
   (void)arg;
 
-  size_t opened_count = open_shellcore_flags();
-  // The active monitor currently depends on both configured flags opening:
-  // AppFocus plus SceSystemStateMgrInfo.
-  if (opened_count < 2) {
+  size_t opened_count = 0;
+  if (!open_shellcore_flags(&opened_count)) {
     if (opened_count != 0)
       close_shellcore_flags();
     set_shellcore_flag_start_result(false);
