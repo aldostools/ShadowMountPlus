@@ -781,20 +781,32 @@ static void apply_runtime_config_reload_effects(const runtime_config_t *old_cfg,
   }
 }
 
+static bool should_abort_scan_cycle(void) {
+  return should_stop_requested();
+}
+
 static bool run_full_scan_cycle(bool startup_sync, const char *reason,
                                 bool *unstable_found_out) {
   scan_candidate_t *candidates = g_scanner_scan_candidates;
 
   log_immediate_scan_reason(reason);
 
+  if (should_abort_scan_cycle())
+    return false;
+
   bool unstable_found = false;
   cleanup_lost_sources_before_scan();
+  if (should_abort_scan_cycle())
+    return false;
 
   int total_found_games = 0;
   int *total_found_ptr = startup_sync ? &total_found_games : NULL;
   int candidate_count = collect_scan_candidates(candidates, MAX_PENDING,
                                                 total_found_ptr,
                                                 &unstable_found);
+  if (should_abort_scan_cycle())
+    return false;
+
   if (candidate_count > 0) {
     if (startup_sync) {
       int new_games = 0;
@@ -807,14 +819,18 @@ static bool run_full_scan_cycle(bool startup_sync, const char *reason,
     }
 
     process_scan_candidates(candidates, candidate_count);
+    if (should_abort_scan_cycle())
+      return false;
   }
 
   mount_backport_overlays(&unstable_found);
+  if (should_abort_scan_cycle())
+    return false;
 
   if (unstable_found_out)
     *unstable_found_out = unstable_found;
 
-  if (startup_sync) {
+  if (startup_sync && !should_abort_scan_cycle()) {
     notify_system_rich(true, "Library Synchronized.\nFound %d games.",
                        total_found_games);
   }
@@ -829,15 +845,27 @@ static bool run_targeted_scan_cycle(int scan_root_index,
 
   log_debug("[SCAN] running targeted scan for %s", scan_root);
 
+  if (should_abort_scan_cycle())
+    return false;
+
   bool unstable_found = false;
   cleanup_lost_sources_for_scan_root(scan_root);
+  if (should_abort_scan_cycle())
+    return false;
 
   int candidate_count = collect_scan_candidates_for_scan_root(
       scan_root, candidates, MAX_PENDING, NULL, &unstable_found);
+  if (should_abort_scan_cycle())
+    return false;
+
   if (candidate_count > 0)
     process_scan_candidates(candidates, candidate_count);
+  if (should_abort_scan_cycle())
+    return false;
 
   mount_backport_overlays_for_scan_root(scan_root, &unstable_found);
+  if (should_abort_scan_cycle())
+    return false;
 
   if (unstable_found_out)
     *unstable_found_out = unstable_found;

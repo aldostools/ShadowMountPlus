@@ -375,10 +375,19 @@ int main(void) {
     goto shutdown;
   }
 
+  log_debug("[STARTUP] post-LVD cleanup begin");
+  log_debug("[STARTUP] cleanup_staged_mount_links begin");
   cleanup_staged_mount_links();
+  log_debug("[STARTUP] cleanup_staged_mount_links done");
+  log_debug("[STARTUP] cleanup_duplicate_title_mounts begin");
   cleanup_duplicate_title_mounts();
-  if (!sm_scanner_run_startup_sync())
+  log_debug("[STARTUP] cleanup_duplicate_title_mounts done");
+  log_debug("[STARTUP] scanner startup sync begin");
+  if (!sm_scanner_run_startup_sync()) {
+    log_debug("[STARTUP] scanner startup sync aborted");
     goto shutdown;
+  }
+  log_debug("[STARTUP] scanner startup sync done");
   sm_scanner_run_loop();
 
 shutdown:

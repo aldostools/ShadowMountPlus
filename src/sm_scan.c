@@ -434,14 +434,20 @@ void mount_backport_overlays_for_scan_root(const char *scan_root,
 
 // --- Unified Scan Pass (images + game candidates) ---
 void cleanup_lost_sources_before_scan(void) {
+  log_debug("  [SCAN] pre-scan cleanup begin");
   // 1) Drop stale game cache entries for deleted sources.
+  log_debug("  [SCAN] pre-scan cleanup: prune_game_cache");
   prune_game_cache();
   // 2) Drop stale/broken mount links and unmount stale /system_ex stacks.
+  log_debug("  [SCAN] pre-scan cleanup: cleanup_mount_links");
   cleanup_mount_links(NULL, true);
   // 3) Unmount stale image mounts for deleted image files.
+  log_debug("  [SCAN] pre-scan cleanup: cleanup_stale_image_mounts");
   cleanup_stale_image_mounts();
   // 4) Drop stale path-state entries.
+  log_debug("  [SCAN] pre-scan cleanup: prune_path_state");
   prune_path_state();
+  log_debug("  [SCAN] pre-scan cleanup done");
 }
 
 void cleanup_lost_sources_for_scan_root(const char *scan_root) {

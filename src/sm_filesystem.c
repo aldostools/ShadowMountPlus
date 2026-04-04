@@ -646,6 +646,8 @@ static int copy_param_json_rewrite(const char *src, const char *dst) {
 
   if (ret == 0 && hit)
     log_debug("  [COPY] param.json patched: %s", dst);
+  if (ret != 0)
+    (void)unlink(dst);
 
   free(buf);
   return ret;
@@ -684,6 +686,8 @@ int copy_file(const char *src, const char *dst) {
     ret = -1;
   if (fclose(fs) != 0)
     ret = -1;
+  if (ret != 0)
+    (void)unlink(dst);
   return ret;
 }
 

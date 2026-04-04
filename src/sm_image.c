@@ -889,12 +889,17 @@ void cleanup_stale_image_mounts(void) {
   if (should_stop_requested())
     return;
 
+  log_debug("  [IMG] stale image cleanup begin");
   for (int k = 0; k < MAX_IMAGE_MOUNTS; k++) {
     image_cache_entry_t cached_entry;
     if (should_stop_requested())
       return;
     if (!get_image_cache_entry(k, &cached_entry))
       continue;
+
+    log_debug("  [IMG][%s] stale cleanup check: slot=%d source=%s mount=%s",
+              attach_backend_name(cached_entry.backend), k, cached_entry.path,
+              cached_entry.mount_point);
 
     if (!path_exists(cached_entry.path)) {
       log_debug("  [IMG][%s] Source removed, unmounting: %s",
@@ -922,6 +927,7 @@ void cleanup_stale_image_mounts(void) {
       notify_image_mount_failed(source_path, mount_err);
     }
   }
+  log_debug("  [IMG] stale image cleanup done");
 }
 
 void cleanup_stale_image_mounts_for_root(const char *root) {

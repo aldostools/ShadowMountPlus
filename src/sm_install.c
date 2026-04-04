@@ -120,6 +120,9 @@ static bool mount_and_install(const char *src_path, const char *title_id,
   restage_staging = (!is_remount || should_register);
   restage_appmeta = (!is_remount || appmeta_missing);
 
+  if (should_stop_requested())
+    return false;
+
   // COPY FILES
   if (restage_staging || restage_appmeta) {
     snprintf(src_sce_sys, sizeof(src_sce_sys), "%s/sce_sys", src_path);
@@ -161,6 +164,9 @@ static bool mount_and_install(const char *src_path, const char *title_id,
     }
     metadata_restaged = true;
   }
+
+  if (should_stop_requested())
+    return false;
 
   if (!mount_title_nullfs(title_id, src_path)) {
     log_debug("  [LINK] nullfs mount failed: title=%s src=%s", title_id,
@@ -265,6 +271,9 @@ void process_scan_candidates(const scan_candidate_t *candidates,
       clear_failed_mount_attempts(c->title_id);
       cache_game_entry(c->path, c->title_id, c->title_name);
     } else {
+      if (should_stop_requested())
+        return;
+
       uint8_t failed_attempts = bump_failed_mount_attempts(c->title_id);
       if (failed_attempts == MAX_FAILED_MOUNT_ATTEMPTS) {
         log_debug("  [RETRY] limit reached (%u/%u): %s (%s)",
