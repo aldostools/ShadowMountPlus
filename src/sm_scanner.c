@@ -796,7 +796,7 @@ static bool run_full_scan_cycle(bool startup_sync, const char *reason,
     return false;
 
   bool unstable_found = false;
-  cleanup_lost_sources_before_scan();
+  cleanup_lost_sources_before_scan(startup_sync);
   if (should_abort_scan_cycle())
     return false;
 

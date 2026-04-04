@@ -6,7 +6,8 @@
 typedef struct scan_candidate scan_candidate_t;
 
 // Unmount and clean up mounts whose backing sources disappeared.
-void cleanup_lost_sources_before_scan(void);
+// When log_progress is true, emit detailed pre-scan cleanup logs.
+void cleanup_lost_sources_before_scan(bool log_progress);
 // Unmount and clean up mounts whose backing sources disappeared under one root.
 void cleanup_lost_sources_for_scan_root(const char *scan_root);
 // Scan configured roots and collect install candidates.

@@ -317,18 +317,12 @@ static void ensure_runtime_config_file(void) {
 }
 
 static void cleanup_kstuff_noautomount_files(void) {
-  static const char *const paths[] = {
-      KSTUFF_NOAUTOMOUNT_FILE,
-      "/data/.kstuff.noautomount",
-  };
-
-  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-    const char *path = paths[i];
-    if (unlink(path) == 0) {
-      log_debug("[KSTUFF] removed shutdown sentinel: %s", path);
-    } else if (errno != ENOENT) {
-      log_debug("[KSTUFF] failed to remove %s: %s", path, strerror(errno));
-    }
+  if (unlink(KSTUFF_NOAUTOMOUNT_FILE) == 0) {
+    log_debug("[KSTUFF] removed shutdown sentinel: %s",
+              KSTUFF_NOAUTOMOUNT_FILE);
+  } else if (errno != ENOENT) {
+    log_debug("[KSTUFF] failed to remove %s: %s", KSTUFF_NOAUTOMOUNT_FILE,
+              strerror(errno));
   }
 }
 
