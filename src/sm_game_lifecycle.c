@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/event.h>
 
 #include "sm_fakelib.h"
@@ -10,6 +11,7 @@
 #include "sm_limits.h"
 #include "sm_log.h"
 #include "sm_runtime.h"
+#include "sm_scanner.h"
 #include "sm_time.h"
 
 #define MAX_PENDING_GAME_EXEC_CANDIDATES 32
@@ -33,8 +35,16 @@ static pthread_mutex_t g_game_lifecycle_start_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_game_lifecycle_start_cond = PTHREAD_COND_INITIALIZER;
 static bool g_game_lifecycle_start_ready = false;
 static bool g_game_lifecycle_start_success = false;
+static _Atomic pid_t g_active_game_pid = 0;
 
 static bool register_game_exit_watch(int kq, pid_t pid);
+
+static void publish_active_game_pid(pid_t pid) {
+  pid_t previous_pid = atomic_exchange(&g_active_game_pid, pid);
+  if (previous_pid == pid)
+    return;
+  sm_scanner_wake();
+}
 
 static bool is_supported_title_id(const char *title_id) {
   return strncmp(title_id, "PPSA", 4) == 0 || strncmp(title_id, "CUSA", 4) == 0;
@@ -133,6 +143,7 @@ static bool dispatch_game_launch(int kq, pid_t pid, uint64_t exec_time_us,
 
   log_debug("  [GAME] started: %s pid=%ld app_id=0x%08X", title_id,
             (long)pid, app_id);
+  publish_active_game_pid(pid);
   sm_kstuff_game_on_exec(pid, title_id, app_id, exec_time_us);
   sm_fakelib_game_on_exec(pid, title_id);
   return true;
@@ -355,6 +366,8 @@ static void handle_game_exit(pid_t pid) {
   pending_game_launch_t *entry = find_pending_game_launch(pid);
   if (entry)
     clear_pending_game_launch(entry);
+  if (atomic_load(&g_active_game_pid) == pid)
+    publish_active_game_pid(0);
   sm_fakelib_game_on_exit(pid);
   sm_kstuff_game_on_exit(pid);
 }
@@ -434,14 +447,13 @@ static void *game_lifecycle_watcher_main(void *arg) {
   clear_all_pending_game_launches();
   sm_fakelib_game_shutdown();
   sm_kstuff_game_shutdown();
+  publish_active_game_pid(0);
   close(kq);
   log_debug("  [GAME] lifecycle watcher stopped");
   return NULL;
 }
 
 bool start_game_lifecycle_watcher(void) {
-  if (!sm_fakelib_game_feature_enabled() && !sm_kstuff_game_feature_enabled())
-    return true;
   if (g_game_lifecycle_thread_started)
     return true;
   if (pipe(g_game_lifecycle_wake_pipe) != 0) {
@@ -508,19 +520,15 @@ void stop_game_lifecycle_watcher(void) {
   (void)pthread_join(g_game_lifecycle_thread, NULL);
   g_game_lifecycle_thread_started = false;
   g_game_lifecycle_stop_requested = 0;
+  publish_active_game_pid(0);
   close_game_lifecycle_wake_pipe();
 }
 
+bool sm_game_lifecycle_has_active_game(void) {
+  return atomic_load(&g_active_game_pid) > 0;
+}
+
 bool refresh_game_lifecycle_watcher(void) {
-  bool should_run =
-      sm_fakelib_game_feature_enabled() || sm_kstuff_game_feature_enabled();
-
-  if (!should_run) {
-    if (g_game_lifecycle_thread_started)
-      stop_game_lifecycle_watcher();
-    return true;
-  }
-
   if (!g_game_lifecycle_thread_started)
     return start_game_lifecycle_watcher();
 

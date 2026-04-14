@@ -3,13 +3,15 @@
 
 #include <stdbool.h>
 
-// Start the shared game lifecycle watcher used by backport fakelib and kstuff.
+// Start the shared game lifecycle watcher used by runtime game features.
 bool start_game_lifecycle_watcher(void);
 // Wake the shared watcher so pending lifecycle work is processed immediately.
 void wake_game_lifecycle_watcher(void);
 // Stop the shared watcher and let lifecycle modules clean up tracked state.
 void stop_game_lifecycle_watcher(void);
-// Start or stop the shared watcher to match the current runtime config.
+// Return true when a supported game is currently being tracked as running.
+bool sm_game_lifecycle_has_active_game(void);
+// Ensure the shared watcher is running for runtime game-state tracking.
 bool refresh_game_lifecycle_watcher(void);
 
 #endif

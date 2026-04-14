@@ -941,15 +941,20 @@ static uint64_t compute_next_scan_deadline_us(uint64_t now_us,
   return next_deadline;
 }
 
-static void build_wait_timeout(struct timespec *timeout, uint64_t now_us,
-                               uint64_t deadline_us) {
+static const struct timespec *build_wait_timeout(struct timespec *timeout,
+                                                 uint64_t now_us,
+                                                 uint64_t deadline_us) {
+  if (deadline_us == 0)
+    return NULL;
+
   memset(timeout, 0, sizeof(*timeout));
   if (deadline_us <= now_us)
-    return;
+    return timeout;
 
   uint64_t delta_us = deadline_us - now_us;
   timeout->tv_sec = (time_t)(delta_us / 1000000ull);
   timeout->tv_nsec = (long)((delta_us % 1000000ull) * 1000ull);
+  return timeout;
 }
 
 static bool process_scanner_events(int kq, const struct timespec *timeout,
@@ -1170,6 +1175,12 @@ void sm_scanner_run_loop(void) {
     }
 
     uint64_t now_us = monotonic_time_us();
+    if (sm_game_lifecycle_has_active_game()) {
+      next_full_resync_us = 0;
+    } else if (next_full_resync_us == 0) {
+      next_full_resync_us = now_us;
+    }
+
     if (config_probe_due(now_us)) {
       g_scanner_config_probe_due_us = 0;
       reopen_config_file_watch(kq, now_us);
@@ -1203,7 +1214,7 @@ void sm_scanner_run_loop(void) {
       continue;
     }
 
-    if (now_us >= next_full_resync_us) {
+    if (next_full_resync_us != 0 && now_us >= next_full_resync_us) {
       bool unstable_found = false;
       if (!run_full_scan_cycle(false, NULL, &unstable_found))
         break;
@@ -1280,10 +1291,11 @@ void sm_scanner_run_loop(void) {
     uint64_t deadline_us =
         compute_next_scan_deadline_us(now_us, next_full_resync_us);
     struct timespec timeout;
-    build_wait_timeout(&timeout, now_us, deadline_us);
+    const struct timespec *timeout_ptr =
+        build_wait_timeout(&timeout, now_us, deadline_us);
 
     bool timed_out = false;
-    if (!process_scanner_events(kq, &timeout, &timed_out)) {
+    if (!process_scanner_events(kq, timeout_ptr, &timed_out)) {
       close(kq);
       clear_scanner_watch_entries();
       request_scanner_shutdown("scanner kevent wait failed");
