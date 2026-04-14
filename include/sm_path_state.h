@@ -28,5 +28,11 @@ bool is_image_mount_limited(const char *path);
 uint8_t bump_image_mount_attempts(const char *path);
 // Clear image mount retry state for a path.
 void clear_image_mount_attempts(const char *path);
+// Return whether backport overlay remounts are suppressed for a path.
+bool is_backport_mount_blocked(const char *path);
+// Record the first failed backport overlay mount for a path.
+void note_backport_mount_failure(const char *path);
+// Clear failed backport overlay mount state for a path.
+void clear_backport_mount_failure(const char *path);
 
 #endif

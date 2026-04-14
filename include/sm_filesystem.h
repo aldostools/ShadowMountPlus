@@ -29,7 +29,8 @@ bool reconcile_title_backport_mount(const char *title_id, const char *src_path,
                                     const char *expected_backport_path,
                                     bool *overlay_active_out);
 // Mount a prepared backport overlay on top of an already mounted title.
-void mount_backport_overlay(const char *mount_point,
+// Returns false only when nmount() itself fails.
+bool mount_backport_overlay(const char *mount_point,
                             const char *backport_path,
                             const char *title_id);
 // Unmount all managed /system_ex/app/<title_id> mount stacks on shutdown.

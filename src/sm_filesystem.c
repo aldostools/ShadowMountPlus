@@ -509,20 +509,20 @@ bool reconcile_title_backport_mount(const char *title_id, const char *src_path,
   return backport_present;
 }
 
-void mount_backport_overlay(const char *mount_point,
+bool mount_backport_overlay(const char *mount_point,
                             const char *backport_path,
                             const char *title_id) {
   struct stat backport_st;
   if (stat(backport_path, &backport_st) != 0 || !S_ISDIR(backport_st.st_mode))
-    return;
+    return true;
 
   struct statfs mounted_sfs;
   if (statfs(mount_point, &mounted_sfs) != 0 ||
       strcmp(mounted_sfs.f_mntonname, mount_point) != 0) {
-    return;
+    return true;
   }
   if (strcmp(mounted_sfs.f_fstypename, "unionfs") == 0)
-    return;
+    return true;
 
   bool mount_read_only = ((mounted_sfs.f_flags & MNT_RDONLY) != 0);
   struct iovec overlay_iov[] = {
@@ -530,13 +530,15 @@ void mount_backport_overlay(const char *mount_point,
       IOVEC_ENTRY("from"),   IOVEC_ENTRY(backport_path),
       IOVEC_ENTRY("fspath"), IOVEC_ENTRY(mount_point),
       IOVEC_ENTRY("copymode"), IOVEC_ENTRY("transparent"),
-      IOVEC_ENTRY("notime"), IOVEC_ENTRY(NULL),
-      IOVEC_ENTRY("fnodup"), IOVEC_ENTRY(NULL)};
+      IOVEC_ENTRY("noatime"), IOVEC_ENTRY(NULL),
+      IOVEC_ENTRY("fnodup"), IOVEC_ENTRY(NULL)
+    };
+
   int overlay_flags = mount_read_only ? MNT_RDONLY : 0;
   if (nmount(overlay_iov, IOVEC_SIZE(overlay_iov), overlay_flags) == 0) {
     log_debug("  [IMG] backport overlay mounted (%s): %s -> %s",
               mount_read_only ? "ro" : "rw", backport_path, mount_point);
-    return;
+    return true;
   }
 
   int overlay_err = errno;
@@ -544,6 +546,7 @@ void mount_backport_overlay(const char *mount_point,
             mount_point, strerror(overlay_err));
   notify_system("Backport overlay failed: %s\n%s\n0x%08X", title_id,
                 backport_path, (uint32_t)overlay_err);
+  return false;
 }
 
 static bool unmount_controlled_mount_stack(const char *path) {

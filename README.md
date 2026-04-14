@@ -105,7 +105,8 @@ Backport overlay behavior:
 - For each `scanpath`, use:
   - `<scanpath>/backports/<TITLE_ID>/`
 - The `backports` folder is ignored during normal game scanning.
-- A backport is applied automatically to the matching mounted game from the same scan path.
+- A backport is applied automatically to the matching mounted game from any configured scan path.
+- If multiple scan paths provide the same title backport, the game's own scan path wins; otherwise scan path order is used.
 - If `/mnt/sandbox/<TITLE_ID>_XXX/app0/fakelib` exists while the game is running, ShadowMount+ also mounts it into that game's sandbox `common/lib`.
 - `backport_fakelib=0` disables the sandbox `fakelib` watcher.
 - For `backport_fakelib` to work correctly, the standalone `BackPork` payload must be disabled. Running both at the same time will conflict.

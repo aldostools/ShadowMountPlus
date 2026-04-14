@@ -796,7 +796,7 @@ static bool run_full_scan_cycle(bool startup_sync, const char *reason,
     return false;
 
   bool unstable_found = false;
-  cleanup_lost_sources_before_scan(startup_sync);
+  cleanup_lost_sources_before_scan();
   if (should_abort_scan_cycle())
     return false;
 
@@ -861,7 +861,7 @@ static bool run_targeted_scan_cycle(int scan_root_index,
   if (should_abort_scan_cycle())
     return false;
 
-  mount_backport_overlays_for_scan_root(scan_root, &unstable_found);
+  mount_backport_overlays(&unstable_found);
   if (should_abort_scan_cycle())
     return false;
 

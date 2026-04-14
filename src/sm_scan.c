@@ -359,19 +359,57 @@ static bool collect_candidate_image_visit(const char *image_path,
   return true;
 }
 
-static bool build_backport_mount_context(const char *title_id,
-                                         const char *owning_scan_path,
-                                         char backport_path[MAX_PATH],
-                                         char system_ex_path[MAX_PATH]) {
-  if (!owning_scan_path || owning_scan_path[0] == '\0')
-    return false;
-  char backport_root[MAX_PATH];
-  if (!build_backports_root_path(owning_scan_path, backport_root))
+static bool build_backport_path_for_scan_root(const char *title_id,
+                                              const char *scan_path,
+                                              char backport_path[MAX_PATH]) {
+  if (!title_id || title_id[0] == '\0' || !scan_path || scan_path[0] == '\0')
     return false;
 
-  snprintf(backport_path, MAX_PATH, "%s/%s", backport_root, title_id);
-  snprintf(system_ex_path, MAX_PATH, "/system_ex/app/%s", title_id);
-  return true;
+  char backport_root[MAX_PATH];
+  if (!build_backports_root_path(scan_path, backport_root))
+    return false;
+
+  int written = snprintf(backport_path, MAX_PATH, "%s/%s", backport_root,
+                         title_id);
+  return written > 0 && (size_t)written < MAX_PATH;
+}
+
+static bool backport_path_is_dir(const char *backport_path) {
+  struct stat st;
+  return backport_path && stat(backport_path, &st) == 0 &&
+         S_ISDIR(st.st_mode);
+}
+
+static bool resolve_backport_path(const char *title_id,
+                                  const char *owning_scan_path,
+                                  char backport_path[MAX_PATH]) {
+  if (!title_id || title_id[0] == '\0')
+    return false;
+
+  backport_path[0] = '\0';
+  if (build_backport_path_for_scan_root(title_id, owning_scan_path,
+                                        backport_path) &&
+      backport_path_is_dir(backport_path)) {
+    return true;
+  }
+
+  for (int i = 0; i < get_scan_path_count(); i++) {
+    const char *scan_path = get_scan_path(i);
+    if (owning_scan_path && strcmp(scan_path, owning_scan_path) == 0)
+      continue;
+
+    char candidate_path[MAX_PATH];
+    if (!build_backport_path_for_scan_root(title_id, scan_path, candidate_path))
+      continue;
+    if (!backport_path_is_dir(candidate_path))
+      continue;
+
+    (void)strlcpy(backport_path, candidate_path, MAX_PATH);
+    return true;
+  }
+
+  backport_path[0] = '\0';
+  return false;
 }
 
 typedef struct {
@@ -390,11 +428,11 @@ static bool mount_backport_overlay_for_cached_game(const char *source_path,
 
   backport_overlay_ctx_t *ctx = (backport_overlay_ctx_t *)ctx_ptr;
   char backport_path[MAX_PATH];
-  char system_ex_path[MAX_PATH];
-  if (!build_backport_mount_context(title_id, owning_scan_root, backport_path,
-                                    system_ex_path)) {
+  if (!resolve_backport_path(title_id, owning_scan_root, backport_path)) {
     return true;
   }
+  if (is_backport_mount_blocked(backport_path))
+    return true;
 
   bool overlay_active = false;
   if (!reconcile_title_backport_mount(title_id, source_path, backport_path,
@@ -414,50 +452,34 @@ static bool mount_backport_overlay_for_cached_game(const char *source_path,
     return true;
   }
 
-  mount_backport_overlay(system_ex_path, backport_path, title_id);
+  char system_ex_path[MAX_PATH];
+  snprintf(system_ex_path, sizeof(system_ex_path), "/system_ex/app/%s",
+           title_id);
+  if (!mount_backport_overlay(system_ex_path, backport_path, title_id)) {
+    note_backport_mount_failure(backport_path);
+    return true;
+  }
+  clear_backport_mount_failure(backport_path);
   return true;
 }
 
-static void mount_backport_overlays_internal(const char *scan_root_filter,
-                                             bool *unstable_found_out) {
+void mount_backport_overlays(bool *unstable_found_out) {
   backport_overlay_ctx_t ctx = {
       .unstable_found_out = unstable_found_out,
   };
-  for_each_cached_game_entry(scan_root_filter, mount_backport_overlay_for_cached_game,
-                             &ctx);
-}
-
-void mount_backport_overlays(bool *unstable_found_out) {
-  mount_backport_overlays_internal(NULL, unstable_found_out);
-}
-
-void mount_backport_overlays_for_scan_root(const char *scan_root,
-                                           bool *unstable_found_out) {
-  mount_backport_overlays_internal(scan_root, unstable_found_out);
+  for_each_cached_game_entry(NULL, mount_backport_overlay_for_cached_game, &ctx);
 }
 
 // --- Unified Scan Pass (images + game candidates) ---
-void cleanup_lost_sources_before_scan(bool log_progress) {
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup begin");
+void cleanup_lost_sources_before_scan(void) {
   // 1) Drop stale game cache entries for deleted sources.
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup: prune_game_cache");
   prune_game_cache();
   // 2) Drop stale/broken mount links and unmount stale /system_ex stacks.
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup: cleanup_mount_links");
   cleanup_mount_links(NULL, true);
   // 3) Unmount stale image mounts for deleted image files.
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup: cleanup_stale_image_mounts");
   cleanup_stale_image_mounts();
   // 4) Drop stale path-state entries.
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup: prune_path_state");
   prune_path_state();
-  if (log_progress)
-    log_debug("  [SCAN] pre-scan cleanup done");
 }
 
 void cleanup_lost_sources_for_scan_root(const char *scan_root) {

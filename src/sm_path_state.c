@@ -12,6 +12,7 @@ struct PathStateEntry {
   uint8_t image_mount_attempts;
   bool missing_param_limit_logged;
   bool image_mount_limit_logged;
+  bool backport_mount_blocked;
   bool game_info_cached;
   bool game_info_valid;
   time_t game_info_mtime;
@@ -79,6 +80,7 @@ static struct PathStateEntry *create_path_state(const char *path) {
           continue;
         if (g_path_state[k].missing_param_attempts == 0 &&
             g_path_state[k].image_mount_attempts == 0 &&
+            !g_path_state[k].backport_mount_blocked &&
             !g_path_state[k].game_info_cached) {
           evict_k = k;
           break;
@@ -248,4 +250,31 @@ void clear_image_mount_attempts(const char *path) {
     return;
   entry->image_mount_attempts = 0;
   entry->image_mount_limit_logged = false;
+}
+
+bool is_backport_mount_blocked(const char *path) {
+  if (!path || path[0] == '\0')
+    return false;
+  struct PathStateEntry *entry = find_path_state(path);
+  return entry ? entry->backport_mount_blocked : false;
+}
+
+void note_backport_mount_failure(const char *path) {
+  if (!path || path[0] == '\0')
+    return;
+  struct PathStateEntry *entry = get_or_create_path_state(path);
+  if (!entry)
+    return;
+  if (entry->backport_mount_blocked)
+    return;
+  entry->backport_mount_blocked = true;
+}
+
+void clear_backport_mount_failure(const char *path) {
+  if (!path || path[0] == '\0')
+    return;
+  struct PathStateEntry *entry = find_path_state(path);
+  if (!entry)
+    return;
+  entry->backport_mount_blocked = false;
 }
