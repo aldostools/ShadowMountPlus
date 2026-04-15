@@ -55,7 +55,7 @@ Supported keys (all optional):
 - `ufs_backend=lvd|md` (default: `lvd`)
 - `backport_fakelib=1|0` (`1` mounts sandbox `fakelib` overlays for running games; default: `1`)
 - `kstuff_game_auto_toggle=1|0` (`1` pauses kstuff after tracked game launches and resumes it on stop; default: `1`)
-- `kstuff_crash_detection=1|0` (`1` enables the early post-auto-pause crash heuristic and autotune updates; default: `0`)
+- `kstuff_crash_detection=1|0` (`1` enables crash monitoring and pause-delay autotune updates; default: `1`)
 - `kstuff_pause_delay_image_seconds=<0..3600>` (delay before pausing kstuff for image-backed launches; default: `25`)
 - `kstuff_pause_delay_direct_seconds=<0..3600>` (delay before pausing kstuff for direct/non-image launches; default: `15`)
 - `kstuff_no_pause=<TITLE_ID>` (repeatable; keeps kstuff enabled for matching titles)
@@ -114,7 +114,7 @@ Backport overlay behavior:
 Kstuff game lifecycle behavior:
 - When `kstuff_game_auto_toggle=1`, ShadowMount watches game `exec/exit` events in the background.
 - Image-backed launches use `kstuff_pause_delay_image_seconds`; direct/non-image launches use `kstuff_pause_delay_direct_seconds`.
-- `kstuff_crash_detection=0` disables the crash heuristic and the automatic pause-delay tuning logic, while leaving normal kstuff auto-pause/auto-resume behavior intact.
+- `kstuff_crash_detection=0` disables crash monitoring and the automatic pause-delay tuning logic, while leaving normal kstuff auto-pause/auto-resume behavior intact.
 - `kstuff_no_pause` skips auto-pause entirely for matching title IDs.
 - `kstuff_delay` overrides the pause delay for matching title IDs, regardless of image/direct launch type.
 - `/data/shadowmount/autotune.ini` overrides both `config.ini` and `autopause.txt` for matching title IDs.
@@ -126,7 +126,8 @@ Kstuff game lifecycle behavior:
   - `direct=<seconds>`
   - `image=<seconds>`
 - If both kinds of rule target the same title, `kstuff_no_pause` takes priority.
-- When ShadowMountPlus detects an early post-auto-pause crash, it doubles the current effective pause delay for that title and upserts it into `/data/shadowmount/autotune.ini` (up to `3600` seconds), then prompts you to launch the game again.
+- When crash monitoring detects an app crash before kstuff was paused, ShadowMountPlus only notifies that the app crashed and kstuff is not to blame.
+- When crash monitoring detects an app crash within 2 minutes after kstuff auto-pause, ShadowMountPlus doubles the applied pause delay for that title and upserts it into `/data/shadowmount/autotune.ini` (up to `3600` seconds), then prompts you to launch the game again.
 - When the last tracked game stops, ShadowMount immediately enables kstuff again if it was the component that disabled it.
 
 

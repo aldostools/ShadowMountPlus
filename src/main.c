@@ -20,6 +20,7 @@
 #include "sm_install.h"
 #include "sm_appdb.h"
 #include "sm_limits.h"
+#include "sm_mdbg.h"
 #include "sm_paths.h"
 
 #ifndef SHADOWMOUNT_VERSION
@@ -406,6 +407,7 @@ int main(void) {
   stop_conflicting_backpork();
   if (!sm_shellcore_flags_start())
     log_debug("  [SHELLFLAG] monitor unavailable");
+  sm_mdbg_init();
   sm_kstuff_init();
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
@@ -450,6 +452,7 @@ shutdown:
   stop_game_lifecycle_watcher();
   sm_scanner_shutdown();
   sm_kstuff_shutdown();
+  sm_mdbg_shutdown();
   cleanup_kstuff_noautomount_files();
   shutdown_title_mounts();
   if (!shutdown_image_mounts()) {

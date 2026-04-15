@@ -10,6 +10,7 @@
 #include "sm_kstuff.h"
 #include "sm_limits.h"
 #include "sm_log.h"
+#include "sm_mdbg.h"
 #include "sm_runtime.h"
 #include "sm_scanner.h"
 #include "sm_time.h"
@@ -275,6 +276,7 @@ static const struct timespec *compute_game_wait_timeout(
 
   next_wake_us = min_nonzero_u64(next_wake_us, next_pending_game_wake_us(now_us));
   next_wake_us = min_nonzero_u64(next_wake_us, sm_kstuff_game_next_wake_us(now_us));
+  next_wake_us = min_nonzero_u64(next_wake_us, sm_mdbg_next_wake_us(now_us));
   if (next_wake_us == 0)
     return NULL;
 
@@ -325,6 +327,7 @@ static void poll_game_modules(int kq) {
   }
 
   sm_kstuff_game_poll();
+  sm_mdbg_poll();
 }
 
 static bool register_game_exit_watch(int kq, pid_t pid) {

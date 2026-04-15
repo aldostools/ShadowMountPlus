@@ -661,8 +661,6 @@ static void poll_shellcore_flag(shellcore_flag_monitor_t *flag) {
     sm_kstuff_note_app_focus((uint32_t)result_pattern);
     wake_game_lifecycle_watcher();
   }
-  if (strcmp(flag->name, "SceLncUtilSystemStatus") == 0)
-    sm_kstuff_note_lnc_system_status(result_pattern);
   if (entered_shutdown_on_going) {
     request_shutdown_stop("SceSystemStateMgrInfo=SHUTDOWN_ON_GOING");
   }

@@ -78,11 +78,11 @@
 # Default: 1
 # kstuff_game_auto_toggle=1
 
-# Detect likely early crashes after auto-pause and autotune pause delay:
-# 1/true/yes/on  -> enable crash heuristic and autotune updates
+# Detect crash-candidate state and autotune pause delay:
+# 1/true/yes/on  -> enable crash monitoring and autotune updates
 # 0/false/no/off -> disable crash detection/autotune logic
-# Default: 0
-# kstuff_crash_detection=0
+# Default: 1
+# kstuff_crash_detection=1
 
 # Delay before pausing kstuff for image-backed titles.
 # Default: 25
