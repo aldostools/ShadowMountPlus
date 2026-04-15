@@ -61,6 +61,7 @@ typedef struct {
 typedef struct {
   bool privilege_probe_done;
   bool privilege_ready;
+  bool klog_open_failed_logged;
   int klog_fd;
   size_t klog_line_length;
   char klog_line[KLOG_LINE_BUFFER_SIZE];
@@ -81,6 +82,7 @@ static bool read_proc_info(pid_t pid, struct kinfo_proc *ki);
 static bool is_mdbg_process_gone_error(int ret);
 static void reset_tracked_game(mdbg_game_state_t *game);
 static void reset_klog_buffer(void);
+static bool open_klog_device(void);
 static void close_klog_device(void);
 static void clear_tracked_game(void);
 static void capture_process_comm(const struct kinfo_proc *ki);
@@ -224,6 +226,31 @@ static void reset_klog_buffer(void) {
   g_mdbg.klog_line[0] = '\0';
 }
 
+static bool open_klog_device(void) {
+  if (g_mdbg.klog_fd >= 0)
+    return true;
+
+  int open_flags = O_RDONLY | O_NONBLOCK;
+#ifdef O_SHLOCK
+  open_flags |= O_SHLOCK;
+#endif
+
+  int fd = open(KLOG_DEVICE_PATH, open_flags);
+  if (fd < 0) {
+    if (!g_mdbg.klog_open_failed_logged) {
+      log_debug("  [MDBG] failed to open %s for %s: %s", KLOG_DEVICE_PATH,
+                g_mdbg.game.title_id[0] != '\0' ? g_mdbg.game.title_id : "?",
+                strerror(errno));
+      g_mdbg.klog_open_failed_logged = true;
+    }
+    return false;
+  }
+
+  g_mdbg.klog_fd = fd;
+  g_mdbg.klog_open_failed_logged = false;
+  return true;
+}
+
 static void close_klog_device(void) {
   if (g_mdbg.klog_fd < 0)
     return;
@@ -231,6 +258,7 @@ static void close_klog_device(void) {
   close(g_mdbg.klog_fd);
   g_mdbg.klog_fd = -1;
   reset_klog_buffer();
+  g_mdbg.klog_open_failed_logged = false;
 }
 
 static void clear_tracked_game(void) {
@@ -420,10 +448,12 @@ static void drain_klog_monitor(void) {
 }
 
 static void poll_klog_monitor(uint64_t now_us) {
-  if (!g_mdbg.game.active || !g_mdbg.game.klog_monitoring_active ||
-      g_mdbg.klog_fd < 0) {
+  if (!g_mdbg.game.active || !g_mdbg.game.klog_monitoring_active) {
     return;
   }
+
+  if (!open_klog_device())
+    return;
 
   char chunk[KLOG_POLL_CHUNK_SIZE];
   for (;;) {
@@ -453,21 +483,9 @@ static void start_klog_monitoring(void) {
   if (!g_mdbg.game.active)
     return;
 
-  if (g_mdbg.klog_fd < 0) {
-    int open_flags = O_RDONLY | O_NONBLOCK;
-#ifdef O_SHLOCK
-    open_flags |= O_SHLOCK;
-#endif
-    int fd = open(KLOG_DEVICE_PATH, open_flags);
-    if (fd < 0) {
-      log_debug("  [MDBG] failed to open %s for %s: %s", KLOG_DEVICE_PATH,
-                g_mdbg.game.title_id, strerror(errno));
-      return;
-    }
-    g_mdbg.klog_fd = fd;
-  }
-
   g_mdbg.game.klog_monitoring_active = true;
+  if (!open_klog_device())
+    return;
   drain_klog_monitor();
 }
 
@@ -598,8 +616,11 @@ void sm_mdbg_poll(void) {
 
   g_mdbg.game.next_poll_us = now_us + GAME_LIFECYCLE_POLL_INTERVAL_US;
 
-  if (!ensure_mdbg_privileges()) return;
-  
+  if (!ensure_mdbg_privileges()) {
+    if (!g_mdbg.game.klog_monitoring_active)
+      g_mdbg.game.next_poll_us = 0;
+    return;
+  }
 
   uint64_t flags = 0;
   int ret = query_mdbg_flags(g_mdbg.game.pid, &flags);
