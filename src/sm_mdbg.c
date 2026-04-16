@@ -1,10 +1,7 @@
-#include "sm_platform.h"
+v#include "sm_platform.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
-#include <sys/proc.h>
-#include <sys/sysctl.h>
-#include <sys/user.h>
 
 #include "sm_config_mount.h"
 #include "sm_limits.h"
@@ -18,13 +15,11 @@ int sceKernelDebugGetPrivateLogText(void *buffer, size_t buffer_size,
 int sceKernelDebugGetSdkLogText(void *buffer, size_t buffer_size,
                                 char **text, uint64_t *text_size);
 uint64_t sceKernelDebugGetLogBufferSize(void) __asm__("C49jelxiaVE");
-
-#define SYS_mdbg_call 573
+int mdbg_call(void *cmd, void *req, void *res);
 
 #define MDBG_CMD_TYPE_SERVICE 1ull
 #define MDBG_CMD_PROCESS_STATE 30ull
 #define MDBG_SUBCMD_FLAGS 2ull
-#define MDBG_SUBCMD_STATE3 16ull
 
 #define MDBG_FLAG_EXCEPTION_STOP 0x00080000ull
 #define MDBG_AUTOTUNE_WINDOW_US (300ull * 1000000ull)
@@ -71,7 +66,6 @@ typedef struct {
   uint64_t pause_time_us;
   uint64_t next_poll_us;
   char title_id[MAX_TITLE_ID];
-  char comm[32];
   char rtld_error_prefix[MDBG_RTLD_ERROR_PREFIX_SIZE];
 } mdbg_game_state_t;
 
@@ -97,9 +91,6 @@ static bool ensure_mdbg_privileges(void);
 static int mdbg_call_raw(int64_t pid, uint64_t subcmd, uint64_t arg,
                          int64_t *status_out, uint64_t *value_out);
 static int query_mdbg_flags(pid_t pid, uint64_t *flags_out);
-static int query_mdbg_state3(pid_t pid, uint32_t *state_flags_out,
-                             uint32_t *stop_reason_out);
-static bool read_proc_info(pid_t pid, struct kinfo_proc *ki);
 static bool is_mdbg_process_gone_error(int ret);
 static void reset_log_line_buffer(void);
 static void reset_log_snapshot(void);
@@ -109,19 +100,17 @@ static int fetch_log_text(const char **text_out, size_t *text_len_out);
 static size_t find_log_overlap(const char *current, size_t current_len);
 static void update_log_snapshot(const char *text, size_t text_len);
 static void clear_tracked_game(void);
-static bool log_line_matches_tracked_load_error(const char *line);
-static bool reason_is_rtld_error(const char *reason);
+static bool matches_tracked_rtld_error(const char *text);
 static void summarize_failure_reason(const char *reason, char *summary_out,
-                                     size_t summary_out_size);
+                                     size_t summary_out_size,
+                                     bool is_rtld_error);
 static void handle_pre_pause_failure(const char *reason);
 static void handle_post_pause_failure(const char *reason, uint64_t now_us);
 static void process_log_line(const char *line, uint64_t now_us);
 static void append_log_char(char ch, uint64_t now_us);
-static void drain_log_monitor(void);
 static void poll_log_monitor(uint64_t now_us);
 static void start_log_monitoring(void);
-static void handle_crash_candidate(uint64_t flags, uint32_t state_flags,
-                                   uint32_t stop_reason, uint64_t now_us);
+static void handle_crash_candidate(uint64_t flags, uint64_t now_us);
 
 static bool sm_mdbg_enabled(void) {
   return runtime_config()->kstuff_crash_detection_enabled &&
@@ -169,19 +158,15 @@ static bool ensure_mdbg_privileges(void) {
 static int mdbg_call_raw(int64_t pid, uint64_t subcmd, uint64_t arg,
                          int64_t *status_out, uint64_t *value_out) {
   mdbg_cmd_t cmd = {MDBG_CMD_TYPE_SERVICE, MDBG_CMD_PROCESS_STATE};
-  mdbg_req_t req;
-  mdbg_res_t res;
-  long syscall_ret;
-
-  memset(&req, 0, sizeof(req));
-  memset(&res, 0, sizeof(res));
-  req.pid = pid;
-  req.subcmd = (int64_t)subcmd;
-  req.arg = arg;
-
-  syscall_ret = syscall(SYS_mdbg_call, &cmd, &req, &res);
-  if (syscall_ret == -1)
-    return errno ? -errno : -1;
+  mdbg_req_t req = {
+      .pid = pid,
+      .subcmd = (int64_t)subcmd,
+      .arg = arg,
+  };
+  mdbg_res_t res = {0};
+  int ret = mdbg_call(&cmd, &req, &res);
+  if (ret != 0)
+    return ret;
 
   if (status_out)
     *status_out = res.status;
@@ -201,43 +186,6 @@ static int query_mdbg_flags(pid_t pid, uint64_t *flags_out) {
   if (flags_out)
     *flags_out = value;
   return 0;
-}
-
-static int query_mdbg_state3(pid_t pid, uint32_t *state_flags_out,
-                             uint32_t *stop_reason_out) {
-  int64_t status;
-  uint64_t value;
-  int ret = mdbg_call_raw(pid, MDBG_SUBCMD_STATE3, 3, &status, &value);
-  if (ret < 0)
-    return ret;
-  if (status != 0)
-    return (int)status;
-
-  if (state_flags_out) {
-    uint32_t state_flags = (uint32_t)(value & 7u);
-    if ((value & 0x10u) != 0)
-      state_flags |= 8u;
-    *state_flags_out = state_flags;
-  }
-  if (stop_reason_out)
-    *stop_reason_out = (uint32_t)(value >> 32);
-
-  return 0;
-}
-
-static bool read_proc_info(pid_t pid, struct kinfo_proc *ki) {
-  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
-  size_t buf_size;
-
-  if (!ki || pid <= 0)
-    return false;
-
-  memset(ki, 0, sizeof(*ki));
-  buf_size = sizeof(*ki);
-  if (sysctl(mib, 4, ki, &buf_size, NULL, 0) < 0)
-    return false;
-
-  return buf_size >= sizeof(*ki) && ki->ki_pid == pid;
 }
 
 static bool is_mdbg_process_gone_error(int ret) {
@@ -304,11 +252,6 @@ static int fetch_log_text(const char **text_out, size_t *text_len_out) {
   char *raw_text = NULL;
   uint64_t raw_len = 0;
 
-  if (!text_out || !text_len_out || !g_mdbg.log_storage ||
-      g_mdbg.log_buffer_size == 0) {
-    return -EINVAL;
-  }
-
   *text_out = NULL;
   *text_len_out = 0;
 
@@ -319,7 +262,6 @@ static int fetch_log_text(const char **text_out, size_t *text_len_out) {
     return ret;
 
   if (!raw_text || raw_len == 0) {
-    *text_out = "";
     return 0;
   }
   if (raw_len > g_mdbg.log_buffer_size)
@@ -370,19 +312,15 @@ static void clear_tracked_game(void) {
   free_log_buffers();
 }
 
-static bool log_line_matches_tracked_load_error(const char *line) {
-  return line && g_mdbg.game.active &&
+static bool matches_tracked_rtld_error(const char *text) {
+  return text &&
          g_mdbg.game.rtld_error_prefix[0] != '\0' &&
-         strstr(line, g_mdbg.game.rtld_error_prefix) != NULL;
-}
-
-static bool reason_is_rtld_error(const char *reason) {
-  return reason && g_mdbg.game.rtld_error_prefix[0] != '\0' &&
-         strstr(reason, g_mdbg.game.rtld_error_prefix) != NULL;
+         strstr(text, g_mdbg.game.rtld_error_prefix) != NULL;
 }
 
 static void summarize_failure_reason(const char *reason, char *summary_out,
-                                     size_t summary_out_size) {
+                                     size_t summary_out_size,
+                                     bool is_rtld_error) {
   if (!summary_out || summary_out_size == 0)
     return;
 
@@ -390,7 +328,7 @@ static void summarize_failure_reason(const char *reason, char *summary_out,
   if (!reason || reason[0] == '\0')
     return;
 
-  if (reason_is_rtld_error(reason)) {
+  if (is_rtld_error) {
     const char *open_paren = strrchr(reason, '(');
     const char *close_paren =
         open_paren ? strchr(open_paren + 1, ')') : NULL;
@@ -439,7 +377,9 @@ static void handle_post_pause_failure(const char *reason, uint64_t now_us) {
   }
 
   char reason_summary[128];
-  summarize_failure_reason(reason, reason_summary, sizeof(reason_summary));
+  bool is_rtld_error = matches_tracked_rtld_error(reason);
+  summarize_failure_reason(reason, reason_summary, sizeof(reason_summary),
+                           is_rtld_error);
 
   uint32_t tuned_delay_seconds = 0;
   if (upsert_kstuff_autotune_pause_delay(g_mdbg.game.title_id,
@@ -449,7 +389,7 @@ static void handle_post_pause_failure(const char *reason, uint64_t now_us) {
               g_mdbg.game.title_id, tuned_delay_seconds);
     if (reason_summary[0] != '\0')
       log_debug("  [MDBG] autotune trigger: %s", reason_summary);
-    if (reason_is_rtld_error(reason)) {
+    if (is_rtld_error) {
       notify_system_info("%s: %s. Delay increased to %us.\nLaunch the game again.",
                          g_mdbg.game.title_id,
                          reason_summary[0] != '\0' ? reason_summary
@@ -474,7 +414,7 @@ static void handle_post_pause_failure(const char *reason, uint64_t now_us) {
 }
 
 static void process_log_line(const char *line, uint64_t now_us) {
-  if (!log_line_matches_tracked_load_error(line))
+  if (!matches_tracked_rtld_error(line))
     return;
 
   log_debug("  [MDBG] log load error for %s: %s", g_mdbg.game.title_id, line);
@@ -501,30 +441,6 @@ static void append_log_char(char ch, uint64_t now_us) {
   }
 
   g_mdbg.log_line[g_mdbg.log_line_length++] = ch;
-}
-
-static void drain_log_monitor(void) {
-  if (!g_mdbg.game.log_monitoring_active)
-    return;
-
-  if (!ensure_log_buffers()) {
-    g_mdbg.game.log_monitoring_active = false;
-    return;
-  }
-
-  const char *text = NULL;
-  size_t text_len = 0;
-  int ret = fetch_log_text(&text, &text_len);
-  if (ret < 0) {
-    log_debug("  [MDBG] initial log snapshot failed for %s: 0x%08x",
-              g_mdbg.game.title_id, ret);
-    g_mdbg.game.log_monitoring_active = false;
-    reset_log_snapshot();
-    return;
-  }
-
-  update_log_snapshot(text, text_len);
-  reset_log_line_buffer();
 }
 
 static void poll_log_monitor(uint64_t now_us) {
@@ -579,26 +495,34 @@ static void start_log_monitoring(void) {
     return;
   }
 
+  if (!ensure_log_buffers()) {
+    g_mdbg.game.log_monitoring_active = false;
+    return;
+  }
+
   g_mdbg.game.log_monitoring_active = true;
-  drain_log_monitor();
+
+  const char *text = NULL;
+  size_t text_len = 0;
+  int ret = fetch_log_text(&text, &text_len);
+  if (ret < 0) {
+    log_debug("  [MDBG] initial log snapshot failed for %s: 0x%08x",
+              g_mdbg.game.title_id, ret);
+    g_mdbg.game.log_monitoring_active = false;
+    reset_log_snapshot();
+    return;
+  }
+
+  update_log_snapshot(text, text_len);
+  reset_log_line_buffer();
 }
 
-static void handle_crash_candidate(uint64_t flags, uint32_t state_flags,
-                                   uint32_t stop_reason, uint64_t now_us) {
+static void handle_crash_candidate(uint64_t flags, uint64_t now_us) {
   if (!g_mdbg.game.active)
     return;
 
-  const char *comm = g_mdbg.game.comm[0] != '\0' ? g_mdbg.game.comm : "?";
-  log_debug("  [MDBG] crash-candidate: %s pid=%ld comm=%s flags=0x%08" PRIx64
-            " stateFlags=0x%02" PRIx32 " stopReason=0x%08" PRIx32,
-            g_mdbg.game.title_id, (long)g_mdbg.game.pid, comm, flags,
-            state_flags, stop_reason);
-
-  if (!g_mdbg.game.pause_seen || g_mdbg.game.pause_time_us == 0 ||
-      now_us < g_mdbg.game.pause_time_us) {
-    handle_pre_pause_failure("crash-candidate");
-    return;
-  }
+  log_debug("  [MDBG] crash-candidate: %s pid=%ld flags=0x%08" PRIx64,
+            g_mdbg.game.title_id, (long)g_mdbg.game.pid, flags);
 
   handle_post_pause_failure("crash-candidate", now_us);
 }
@@ -608,9 +532,8 @@ void sm_mdbg_init(void) {
 }
 
 void sm_mdbg_shutdown(void) {
-  clear_tracked_game();
-  g_mdbg.privilege_probe_done = false;
-  g_mdbg.privilege_ready = false;
+  free_log_buffers();
+  memset(&g_mdbg, 0, sizeof(g_mdbg));
 }
 
 void sm_mdbg_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id) {
@@ -641,10 +564,6 @@ void sm_mdbg_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id) {
       (size_t)rtld_prefix_len >= sizeof(g_mdbg.game.rtld_error_prefix)) {
     g_mdbg.game.rtld_error_prefix[0] = '\0';
   }
-
-  struct kinfo_proc ki;
-  if (read_proc_info(pid, &ki))
-    (void)strlcpy(g_mdbg.game.comm, ki.ki_comm, sizeof(g_mdbg.game.comm));
 
   log_debug("  [MDBG] tracking crash-candidate state: %s pid=%ld app_id=0x%08X",
             g_mdbg.game.title_id, (long)pid, app_id);
@@ -709,8 +628,7 @@ void sm_mdbg_poll(void) {
   }
 
   if (!ensure_mdbg_privileges()) {
-    if (!g_mdbg.game.log_monitoring_active)
-      g_mdbg.game.next_poll_us = 0;
+    g_mdbg.game.next_poll_us = 0;
     return;
   }
 
@@ -732,17 +650,5 @@ void sm_mdbg_poll(void) {
   if ((flags & MDBG_FLAG_EXCEPTION_STOP) == 0)
     return;
 
-  uint32_t state_flags = 0;
-  uint32_t stop_reason = 0;
-  ret = query_mdbg_state3(g_mdbg.game.pid, &state_flags, &stop_reason);
-  if (is_mdbg_process_gone_error(ret)) {
-    clear_tracked_game();
-    return;
-  }
-  if (ret != 0) {
-    state_flags = 0;
-    stop_reason = 0;
-  }
-
-  handle_crash_candidate(flags, state_flags, stop_reason, now_us);
+  handle_crash_candidate(flags, now_us);
 }
