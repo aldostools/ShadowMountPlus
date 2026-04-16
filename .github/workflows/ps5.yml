@@ -64,7 +64,7 @@ jobs:
 
       - name: Build payload
         run: |
-          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/pacbrew-repo/sdk/sce_stubs"
+          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/pacbrew-repo/sdk/src/sdk/sce_stubs"
 
       - name: Create release archive
         id: package
