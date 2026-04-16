@@ -34,7 +34,10 @@
 #define RESTART_WAIT_MAX_US 60000000u
 #define KINFO_PID_OFFSET 72
 #define KINFO_TDNAME_OFFSET 447
-#define AUTHID_BASE 0x4801000000000013L
+
+//#define AUTHID_BASE 0x4801000000000013L
+#define AUTHID_BASE 0x4800000000000006ull
+
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;

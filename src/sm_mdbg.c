@@ -13,7 +13,12 @@
 #include "sm_time.h"
 #include "sm_types.h"
 
-#define SCE_AUTHID_COREDUMP 0x4800000000000006ull
+int sceKernelDebugGetPrivateLogText(void *buffer, size_t buffer_size,
+                                    char **text, uint64_t *text_size);
+int sceKernelDebugGetSdkLogText(void *buffer, size_t buffer_size,
+                                char **text, uint64_t *text_size);
+uint64_t sceKernelDebugGetLogBufferSize(void) __asm__("C49jelxiaVE");
+
 #define SYS_mdbg_call 573
 
 #define MDBG_CMD_TYPE_SERVICE 1ull
@@ -23,9 +28,20 @@
 
 #define MDBG_FLAG_EXCEPTION_STOP 0x00080000ull
 #define MDBG_AUTOTUNE_WINDOW_US (300ull * 1000000ull)
-#define KLOG_DEVICE_PATH "/dev/klog"
-#define KLOG_POLL_CHUNK_SIZE 512u
-#define KLOG_LINE_BUFFER_SIZE 512u
+#define MDBG_LOG_LINE_BUFFER_SIZE 512u
+#define MDBG_RTLD_ERROR_PREFIX_SIZE 32u
+#ifndef MDBG_USE_PRIVATE_LOG_TEXT
+#define MDBG_USE_PRIVATE_LOG_TEXT 0
+#endif
+#ifndef MDBG_SKIP_PRIVILEGE_ELEVATION
+#define MDBG_SKIP_PRIVILEGE_ELEVATION 0
+#endif
+
+#if MDBG_USE_PRIVATE_LOG_TEXT
+#define MDBG_FETCH_LOG_TEXT sceKernelDebugGetPrivateLogText
+#else
+#define MDBG_FETCH_LOG_TEXT sceKernelDebugGetSdkLogText
+#endif
 
 typedef struct {
   uint64_t type;
@@ -47,7 +63,7 @@ typedef struct {
 
 typedef struct {
   bool active;
-  bool klog_monitoring_active;
+  bool log_monitoring_active;
   bool pause_seen;
   pid_t pid;
   uint32_t pause_delay_seconds;
@@ -56,22 +72,27 @@ typedef struct {
   uint64_t next_poll_us;
   char title_id[MAX_TITLE_ID];
   char comm[32];
+  char rtld_error_prefix[MDBG_RTLD_ERROR_PREFIX_SIZE];
 } mdbg_game_state_t;
 
 typedef struct {
   bool privilege_probe_done;
   bool privilege_ready;
-  bool klog_open_failed_logged;
-  int klog_fd;
-  size_t klog_line_length;
-  char klog_line[KLOG_LINE_BUFFER_SIZE];
+  size_t log_buffer_size;
+  size_t log_snapshot_length;
+  size_t log_line_length;
+  char *log_snapshot;
+  char *log_storage;
+  char log_line[MDBG_LOG_LINE_BUFFER_SIZE];
   mdbg_game_state_t game;
 } sm_mdbg_state_t;
 
 static sm_mdbg_state_t g_mdbg;
 
 static bool sm_mdbg_enabled(void);
+#if !MDBG_SKIP_PRIVILEGE_ELEVATION
 static int elevate_to_coredump(void);
+#endif
 static bool ensure_mdbg_privileges(void);
 static int mdbg_call_raw(int64_t pid, uint64_t subcmd, uint64_t arg,
                          int64_t *status_out, uint64_t *value_out);
@@ -80,24 +101,25 @@ static int query_mdbg_state3(pid_t pid, uint32_t *state_flags_out,
                              uint32_t *stop_reason_out);
 static bool read_proc_info(pid_t pid, struct kinfo_proc *ki);
 static bool is_mdbg_process_gone_error(int ret);
-static void reset_tracked_game(mdbg_game_state_t *game);
-static void reset_klog_buffer(void);
-static bool open_klog_device(void);
-static void close_klog_device(void);
+static void reset_log_line_buffer(void);
+static void reset_log_snapshot(void);
+static void free_log_buffers(void);
+static bool ensure_log_buffers(void);
+static int fetch_log_text(const char **text_out, size_t *text_len_out);
+static size_t find_log_overlap(const char *current, size_t current_len);
+static void update_log_snapshot(const char *text, size_t text_len);
 static void clear_tracked_game(void);
-static void capture_process_comm(const struct kinfo_proc *ki);
-static bool parse_klog_rtld_error(const char *line, pid_t *pid_out);
-static bool klog_line_matches_tracked_load_error(const char *line);
+static bool log_line_matches_tracked_load_error(const char *line);
 static bool reason_is_rtld_error(const char *reason);
 static void summarize_failure_reason(const char *reason, char *summary_out,
                                      size_t summary_out_size);
 static void handle_pre_pause_failure(const char *reason);
 static void handle_post_pause_failure(const char *reason, uint64_t now_us);
-static void process_klog_line(const char *line, uint64_t now_us);
-static void append_klog_char(char ch, uint64_t now_us);
-static void drain_klog_monitor(void);
-static void poll_klog_monitor(uint64_t now_us);
-static void start_klog_monitoring(void);
+static void process_log_line(const char *line, uint64_t now_us);
+static void append_log_char(char ch, uint64_t now_us);
+static void drain_log_monitor(void);
+static void poll_log_monitor(uint64_t now_us);
+static void start_log_monitoring(void);
 static void handle_crash_candidate(uint64_t flags, uint32_t state_flags,
                                    uint32_t stop_reason, uint64_t now_us);
 
@@ -106,6 +128,8 @@ static bool sm_mdbg_enabled(void) {
          runtime_config()->kstuff_game_auto_toggle;
 }
 
+#if !MDBG_SKIP_PRIVILEGE_ELEVATION
+#define SCE_AUTHID_COREDUMP 0x4800000000000006ull
 static int elevate_to_coredump(void) {
   static const uint8_t k_priv_caps[16] = {
       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -119,19 +143,25 @@ static int elevate_to_coredump(void) {
 
   return 0;
 }
+#endif
 
 static bool ensure_mdbg_privileges(void) {
   if (g_mdbg.privilege_probe_done)
     return g_mdbg.privilege_ready;
 
   g_mdbg.privilege_probe_done = true;
+#if MDBG_SKIP_PRIVILEGE_ELEVATION
+  g_mdbg.privilege_ready = true;
+  log_debug("  [MDBG] coredump privilege probe skipped");
+#else
   g_mdbg.privilege_ready = elevate_to_coredump() == 0;
   if (g_mdbg.privilege_ready) {
     log_debug("  [MDBG] coredump privileges enabled");
   } else {
     log_debug("  [MDBG] failed to enable coredump privileges; mdbg polling "
-              "disabled, klog monitoring will continue");
+              "disabled, log monitoring disabled");
   }
+#endif
 
   return g_mdbg.privilege_ready;
 }
@@ -214,95 +244,141 @@ static bool is_mdbg_process_gone_error(int ret) {
   return ret == -ESRCH || ret == -ENOENT || ret == ESRCH || ret == ENOENT;
 }
 
-static void reset_tracked_game(mdbg_game_state_t *game) {
-  if (!game)
-    return;
-
-  memset(game, 0, sizeof(*game));
+static void reset_log_line_buffer(void) {
+  g_mdbg.log_line_length = 0;
+  g_mdbg.log_line[0] = '\0';
 }
 
-static void reset_klog_buffer(void) {
-  g_mdbg.klog_line_length = 0;
-  g_mdbg.klog_line[0] = '\0';
+static void reset_log_snapshot(void) {
+  g_mdbg.log_snapshot_length = 0;
+  reset_log_line_buffer();
 }
 
-static bool open_klog_device(void) {
-  if (g_mdbg.klog_fd >= 0)
+static void free_log_buffers(void) {
+  free(g_mdbg.log_snapshot);
+  free(g_mdbg.log_storage);
+  g_mdbg.log_snapshot = NULL;
+  g_mdbg.log_storage = NULL;
+  g_mdbg.log_buffer_size = 0;
+  reset_log_snapshot();
+}
+
+static bool ensure_log_buffers(void) {
+  if (g_mdbg.log_storage && g_mdbg.log_snapshot && g_mdbg.log_buffer_size != 0)
     return true;
 
-  int open_flags = O_RDONLY | O_NONBLOCK;
-#ifdef O_SHLOCK
-  open_flags |= O_SHLOCK;
-#endif
+  free_log_buffers();
 
-  int fd = open(KLOG_DEVICE_PATH, open_flags);
-  if (fd < 0) {
-    if (!g_mdbg.klog_open_failed_logged) {
-      log_debug("  [MDBG] failed to open %s for %s: %s", KLOG_DEVICE_PATH,
-                g_mdbg.game.title_id[0] != '\0' ? g_mdbg.game.title_id : "?",
-                strerror(errno));
-      g_mdbg.klog_open_failed_logged = true;
-    }
+  const char *title_id =
+      g_mdbg.game.title_id[0] != '\0' ? g_mdbg.game.title_id : "?";
+  uint64_t raw_size = sceKernelDebugGetLogBufferSize();
+  if (raw_size == 0) {
+    log_debug("  [MDBG] invalid log buffer size for %s: 0x%016" PRIx64,
+              title_id,
+              raw_size);
     return false;
   }
 
-  g_mdbg.klog_fd = fd;
-  g_mdbg.klog_open_failed_logged = false;
+  size_t buffer_size = (size_t)raw_size;
+  char *storage = malloc(buffer_size);
+  char *snapshot = malloc(buffer_size);
+  if (!storage || !snapshot) {
+    free(storage);
+    free(snapshot);
+    log_debug("  [MDBG] failed to allocate log buffers for %s: size=0x%zx",
+              title_id,
+              buffer_size);
+    return false;
+  }
+
+  g_mdbg.log_storage = storage;
+  g_mdbg.log_snapshot = snapshot;
+  g_mdbg.log_buffer_size = buffer_size;
+  reset_log_snapshot();
+  log_debug("  [MDBG] log monitor ready: %s buffer_size=0x%zx", title_id,
+            buffer_size);
   return true;
 }
 
-static void close_klog_device(void) {
-  if (g_mdbg.klog_fd < 0)
+static int fetch_log_text(const char **text_out, size_t *text_len_out) {
+  char *raw_text = NULL;
+  uint64_t raw_len = 0;
+
+  if (!text_out || !text_len_out || !g_mdbg.log_storage ||
+      g_mdbg.log_buffer_size == 0) {
+    return -EINVAL;
+  }
+
+  *text_out = NULL;
+  *text_len_out = 0;
+
+  int ret =
+      MDBG_FETCH_LOG_TEXT(g_mdbg.log_storage, g_mdbg.log_buffer_size, &raw_text,
+                          &raw_len);
+  if (ret < 0)
+    return ret;
+
+  if (!raw_text || raw_len == 0) {
+    *text_out = "";
+    return 0;
+  }
+  if (raw_len > g_mdbg.log_buffer_size)
+    return -EOVERFLOW;
+
+  *text_out = raw_text;
+  *text_len_out = (size_t)raw_len;
+  return 0;
+}
+
+static size_t find_log_overlap(const char *current, size_t current_len) {
+  if (!g_mdbg.log_snapshot || g_mdbg.log_snapshot_length == 0 || !current ||
+      current_len == 0) {
+    return 0;
+  }
+
+  size_t max_overlap = g_mdbg.log_snapshot_length < current_len
+                           ? g_mdbg.log_snapshot_length
+                           : current_len;
+  for (size_t overlap = max_overlap; overlap > 0; --overlap) {
+    if (!memcmp(g_mdbg.log_snapshot + g_mdbg.log_snapshot_length - overlap,
+                current, overlap)) {
+      return overlap;
+    }
+  }
+
+  return 0;
+}
+
+static void update_log_snapshot(const char *text, size_t text_len) {
+  if (!g_mdbg.log_snapshot || g_mdbg.log_buffer_size == 0)
     return;
 
-  close(g_mdbg.klog_fd);
-  g_mdbg.klog_fd = -1;
-  reset_klog_buffer();
-  g_mdbg.klog_open_failed_logged = false;
+  if (!text || text_len == 0) {
+    g_mdbg.log_snapshot_length = 0;
+    return;
+  }
+
+  if (text_len > g_mdbg.log_buffer_size)
+    text_len = g_mdbg.log_buffer_size;
+
+  memcpy(g_mdbg.log_snapshot, text, text_len);
+  g_mdbg.log_snapshot_length = text_len;
 }
 
 static void clear_tracked_game(void) {
-  reset_tracked_game(&g_mdbg.game);
-  reset_klog_buffer();
+  memset(&g_mdbg.game, 0, sizeof(g_mdbg.game));
+  free_log_buffers();
 }
 
-static void capture_process_comm(const struct kinfo_proc *ki) {
-  if (!ki)
-    return;
-
-  (void)strlcpy(g_mdbg.game.comm, ki->ki_comm, sizeof(g_mdbg.game.comm));
-}
-
-static bool parse_klog_rtld_error(const char *line, pid_t *pid_out) {
-  if (!line || line[0] == '\0')
-    return false;
-
-  if (strstr(line, "[rtld]") == NULL || strstr(line, "ERROR") == NULL)
-    return false;
-
-  const char *open = strchr(line, '<');
-  if (!open)
-    return false;
-
-  char *end = NULL;
-  long parsed_pid = strtol(open + 1, &end, 10);
-  if (end == open + 1 || !end || *end != '>' || parsed_pid <= 0)
-    return false;
-
-  if (pid_out)
-    *pid_out = (pid_t)parsed_pid;
-
-  return true;
-}
-
-static bool klog_line_matches_tracked_load_error(const char *line) {
-  pid_t line_pid = 0;
-  return parse_klog_rtld_error(line, &line_pid) && g_mdbg.game.active &&
-         g_mdbg.game.pid == line_pid;
+static bool log_line_matches_tracked_load_error(const char *line) {
+  return line && g_mdbg.game.active &&
+         g_mdbg.game.rtld_error_prefix[0] != '\0' &&
+         strstr(line, g_mdbg.game.rtld_error_prefix) != NULL;
 }
 
 static bool reason_is_rtld_error(const char *reason) {
-  return parse_klog_rtld_error(reason, NULL);
+  return reason && g_mdbg.game.rtld_error_prefix[0] != '\0' &&
+         strstr(reason, g_mdbg.game.rtld_error_prefix) != NULL;
 }
 
 static void summarize_failure_reason(const char *reason, char *summary_out,
@@ -374,7 +450,7 @@ static void handle_post_pause_failure(const char *reason, uint64_t now_us) {
     if (reason_summary[0] != '\0')
       log_debug("  [MDBG] autotune trigger: %s", reason_summary);
     if (reason_is_rtld_error(reason)) {
-      notify_system_info("%s: %s. Delay increased to %us.",
+      notify_system_info("%s: %s. Delay increased to %us.\nLaunch the game again.",
                          g_mdbg.game.title_id,
                          reason_summary[0] != '\0' ? reason_summary
                                                    : "Can't load module after "
@@ -397,96 +473,114 @@ static void handle_post_pause_failure(const char *reason, uint64_t now_us) {
   clear_tracked_game();
 }
 
-static void process_klog_line(const char *line, uint64_t now_us) {
-  if (!klog_line_matches_tracked_load_error(line))
+static void process_log_line(const char *line, uint64_t now_us) {
+  if (!log_line_matches_tracked_load_error(line))
     return;
 
-  log_debug("  [MDBG] klog load error for %s: %s", g_mdbg.game.title_id, line);
+  log_debug("  [MDBG] log load error for %s: %s", g_mdbg.game.title_id, line);
   handle_post_pause_failure(line, now_us);
 }
 
-static void append_klog_char(char ch, uint64_t now_us) {
+static void append_log_char(char ch, uint64_t now_us) {
   if (!g_mdbg.game.active)
     return;
 
   if (ch == '\r' || ch == '\n') {
-    if (g_mdbg.klog_line_length == 0)
+    if (g_mdbg.log_line_length == 0)
       return;
-    g_mdbg.klog_line[g_mdbg.klog_line_length] = '\0';
-    process_klog_line(g_mdbg.klog_line, now_us);
-    reset_klog_buffer();
+    g_mdbg.log_line[g_mdbg.log_line_length] = '\0';
+    process_log_line(g_mdbg.log_line, now_us);
+    reset_log_line_buffer();
     return;
   }
 
-  if (g_mdbg.klog_line_length + 1u >= sizeof(g_mdbg.klog_line)) {
-    g_mdbg.klog_line[g_mdbg.klog_line_length] = '\0';
-    process_klog_line(g_mdbg.klog_line, now_us);
-    reset_klog_buffer();
+  if (g_mdbg.log_line_length + 1u >= sizeof(g_mdbg.log_line)) {
+    g_mdbg.log_line[g_mdbg.log_line_length] = '\0';
+    process_log_line(g_mdbg.log_line, now_us);
+    reset_log_line_buffer();
   }
 
-  g_mdbg.klog_line[g_mdbg.klog_line_length++] = ch;
+  g_mdbg.log_line[g_mdbg.log_line_length++] = ch;
 }
 
-static void drain_klog_monitor(void) {
-  if (g_mdbg.klog_fd < 0)
+static void drain_log_monitor(void) {
+  if (!g_mdbg.game.log_monitoring_active)
     return;
 
-  char chunk[KLOG_POLL_CHUNK_SIZE];
-  for (;;) {
-    ssize_t read_size = read(g_mdbg.klog_fd, chunk, sizeof(chunk));
-    if (read_size <= 0) {
-      if (read_size < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        log_debug("  [MDBG] /dev/klog initial drain failed for %s: %s",
-                  g_mdbg.game.title_id, strerror(errno));
-        g_mdbg.game.klog_monitoring_active = false;
-      }
-      break;
+  if (!ensure_log_buffers()) {
+    g_mdbg.game.log_monitoring_active = false;
+    return;
+  }
+
+  const char *text = NULL;
+  size_t text_len = 0;
+  int ret = fetch_log_text(&text, &text_len);
+  if (ret < 0) {
+    log_debug("  [MDBG] initial log snapshot failed for %s: 0x%08x",
+              g_mdbg.game.title_id, ret);
+    g_mdbg.game.log_monitoring_active = false;
+    reset_log_snapshot();
+    return;
+  }
+
+  update_log_snapshot(text, text_len);
+  reset_log_line_buffer();
+}
+
+static void poll_log_monitor(uint64_t now_us) {
+  if (!g_mdbg.game.active || !g_mdbg.game.log_monitoring_active) {
+    return;
+  }
+
+  if (!ensure_log_buffers()) {
+    g_mdbg.game.log_monitoring_active = false;
+    return;
+  }
+
+  const char *text = NULL;
+  size_t text_len = 0;
+  int ret = fetch_log_text(&text, &text_len);
+  if (ret < 0) {
+    log_debug("  [MDBG] log snapshot failed for %s: 0x%08x",
+              g_mdbg.game.title_id, ret);
+    g_mdbg.game.log_monitoring_active = false;
+    reset_log_snapshot();
+    return;
+  }
+
+  size_t skip = 0;
+  if (g_mdbg.log_snapshot_length != 0 && text_len >= g_mdbg.log_snapshot_length &&
+      !memcmp(g_mdbg.log_snapshot, text, g_mdbg.log_snapshot_length)) {
+    skip = g_mdbg.log_snapshot_length;
+  } else {
+    skip = find_log_overlap(text, text_len);
+    if (skip == 0 && g_mdbg.log_snapshot_length != 0) {
+      log_debug("  [MDBG] log stream reset or truncated for %s",
+                g_mdbg.game.title_id);
+      reset_log_line_buffer();
     }
   }
 
-  reset_klog_buffer();
-}
-
-static void poll_klog_monitor(uint64_t now_us) {
-  if (!g_mdbg.game.active || !g_mdbg.game.klog_monitoring_active) {
-    return;
+  for (size_t i = skip; i < text_len; ++i) {
+    append_log_char(text[i], now_us);
+    if (!g_mdbg.game.active)
+      return;
   }
 
-  if (!open_klog_device())
-    return;
-
-  char chunk[KLOG_POLL_CHUNK_SIZE];
-  for (;;) {
-    ssize_t read_size = read(g_mdbg.klog_fd, chunk, sizeof(chunk));
-    if (read_size == 0)
-      return;
-    if (read_size < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return;
-
-      log_debug("  [MDBG] /dev/klog read failed for %s: %s",
-                g_mdbg.game.title_id, strerror(errno));
-      g_mdbg.game.klog_monitoring_active = false;
-      reset_klog_buffer();
-      return;
-    }
-
-    for (ssize_t i = 0; i < read_size; ++i) {
-      append_klog_char(chunk[i], now_us);
-      if (!g_mdbg.game.active)
-        return;
-    }
-  }
+  update_log_snapshot(text, text_len);
 }
 
-static void start_klog_monitoring(void) {
+static void start_log_monitoring(void) {
   if (!g_mdbg.game.active)
     return;
 
-  g_mdbg.game.klog_monitoring_active = true;
-  if (!open_klog_device())
+  if (!ensure_mdbg_privileges()) {
+    g_mdbg.game.log_monitoring_active = false;
     return;
-  drain_klog_monitor();
+  }
+
+  g_mdbg.game.log_monitoring_active = true;
+  drain_log_monitor();
 }
 
 static void handle_crash_candidate(uint64_t flags, uint32_t state_flags,
@@ -511,14 +605,10 @@ static void handle_crash_candidate(uint64_t flags, uint32_t state_flags,
 
 void sm_mdbg_init(void) {
   memset(&g_mdbg, 0, sizeof(g_mdbg));
-  g_mdbg.klog_fd = -1;
-  reset_tracked_game(&g_mdbg.game);
-  reset_klog_buffer();
 }
 
 void sm_mdbg_shutdown(void) {
   clear_tracked_game();
-  close_klog_device();
   g_mdbg.privilege_probe_done = false;
   g_mdbg.privilege_ready = false;
 }
@@ -543,10 +633,18 @@ void sm_mdbg_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id) {
   g_mdbg.game.pid = pid;
   g_mdbg.game.next_poll_us = now_us;
   (void)strlcpy(g_mdbg.game.title_id, title_id, sizeof(g_mdbg.game.title_id));
+  int rtld_prefix_len =
+      snprintf(g_mdbg.game.rtld_error_prefix,
+               sizeof(g_mdbg.game.rtld_error_prefix),
+               "[rtld] <%ld> ERROR", (long)pid);
+  if (rtld_prefix_len <= 0 ||
+      (size_t)rtld_prefix_len >= sizeof(g_mdbg.game.rtld_error_prefix)) {
+    g_mdbg.game.rtld_error_prefix[0] = '\0';
+  }
 
   struct kinfo_proc ki;
   if (read_proc_info(pid, &ki))
-    capture_process_comm(&ki);
+    (void)strlcpy(g_mdbg.game.comm, ki.ki_comm, sizeof(g_mdbg.game.comm));
 
   log_debug("  [MDBG] tracking crash-candidate state: %s pid=%ld app_id=0x%08X",
             g_mdbg.game.title_id, (long)pid, app_id);
@@ -563,7 +661,7 @@ void sm_mdbg_game_on_kstuff_pause(pid_t pid, uint64_t pause_time_us,
       g_mdbg.game.pause_time_us + MDBG_AUTOTUNE_WINDOW_US;
   g_mdbg.game.pause_delay_seconds = pause_delay_seconds;
   g_mdbg.game.next_poll_us = pause_time_us;
-  start_klog_monitoring();
+  start_log_monitoring();
 }
 
 void sm_mdbg_game_on_exit(pid_t pid) {
@@ -610,17 +708,17 @@ void sm_mdbg_poll(void) {
     return;
   }
 
-  poll_klog_monitor(now_us);
+  if (!ensure_mdbg_privileges()) {
+    if (!g_mdbg.game.log_monitoring_active)
+      g_mdbg.game.next_poll_us = 0;
+    return;
+  }
+
+  poll_log_monitor(now_us);
   if (!g_mdbg.game.active)
     return;
 
   g_mdbg.game.next_poll_us = now_us + GAME_LIFECYCLE_POLL_INTERVAL_US;
-
-  if (!ensure_mdbg_privileges()) {
-    if (!g_mdbg.game.klog_monitoring_active)
-      g_mdbg.game.next_poll_us = 0;
-    return;
-  }
 
   uint64_t flags = 0;
   int ret = query_mdbg_flags(g_mdbg.game.pid, &flags);
