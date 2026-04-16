@@ -30,6 +30,12 @@ jobs:
           repository: ps5-payload-dev/pacbrew-repo
           path: pacbrew-repo
 
+      - name: Checkout SDK stubs
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/sdk
+          path: ps5-sdk
+
       - name: Setup build environment
         run: |
           sudo apt update
@@ -64,7 +70,7 @@ jobs:
 
       - name: Build payload
         run: |
-          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/pacbrew-repo/sdk/src/sdk/sce_stubs"
+          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/ps5-sdk/sce_stubs"
 
       - name: Create release archive
         id: package
