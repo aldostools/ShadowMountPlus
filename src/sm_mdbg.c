@@ -1,4 +1,4 @@
-v#include "sm_platform.h"
+#include "sm_platform.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
