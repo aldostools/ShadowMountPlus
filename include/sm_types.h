@@ -109,9 +109,14 @@ typedef struct runtime_config {
   bool app_install_all_enabled;
   bool app_install_all_forced;
   bool backport_fakelib_enabled;
+  bool global_fakelib_enabled;
+  bool global_fakelib_mount_first;
   bool kstuff_game_auto_toggle;
   bool kstuff_crash_detection_enabled;
   bool legacy_recursive_scan_forced;
+  char global_fakelib_path[MAX_PATH];
+  uint32_t global_fakelib_exclude_title_count;
+  char global_fakelib_exclude_title_ids[MAX_FAKELIB_EXCLUDE_RULES][MAX_TITLE_ID];
   uint32_t scan_depth;
   uint32_t scan_interval_us;
   uint32_t stability_wait_seconds;

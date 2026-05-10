@@ -54,6 +54,10 @@ Supported keys (all optional):
 - `exfat_backend=lvd|md` (default: `lvd`)
 - `ufs_backend=lvd|md` (default: `lvd`)
 - `backport_fakelib=1|0` (`1` mounts sandbox `fakelib` overlays for running games; default: `1`)
+- `global_fakelib=1|0` (`1` enables the global fakelib overlay when the folder exists; default: `1`)
+- `global_fakelib_path=<absolute_path>` (global fakelib folder; default: `/data/shadowmount/fakelib`)
+- `global_fakelib_priority=game|global` (overlay priority when both global and game fakelib exist; default: `game`)
+- `global_fakelib_exclude=<TITLE_ID>` (repeatable; disables the global fakelib overlay for matching titles)
 - `kstuff_game_auto_toggle=1|0` (`1` pauses kstuff after tracked game launches and resumes it on stop; default: `1`)
 - `kstuff_crash_detection=1|0` (`1` enables crash monitoring and pause-delay autotune updates; default: `1`)
 - `kstuff_pause_delay_image_seconds=<0..3600>` (delay before pausing kstuff for image-backed launches; default: `25`)
@@ -107,8 +111,12 @@ Backport overlay behavior:
 - The `backports` folder is ignored during normal game scanning.
 - A backport is applied automatically to the matching mounted game from any configured scan path.
 - If multiple scan paths provide the same title backport, the game's own scan path wins; otherwise scan path order is used.
-- If `/mnt/sandbox/<TITLE_ID>_XXX/app0/fakelib` exists while the game is running, ShadowMount+ also mounts it into that game's sandbox `common/lib`.
-- `backport_fakelib=0` disables the sandbox `fakelib` watcher.
+- If `/mnt/sandbox/<TITLE_ID>_XXX/app0/fakelib` exists while the game is running, ShadowMount+ mounts it into that game's sandbox `common/lib`.
+- If `global_fakelib=1` and `global_fakelib_path` exists as a directory, ShadowMount+ also mounts that folder into the same sandbox `common/lib`.
+- When both global and per-game fakelib exist, the default gives the game's own `fakelib` priority by mounting `/data/shadowmount/fakelib` first and then the game-specific fakelib.
+- `global_fakelib_priority=global` reverses that priority.
+- Use repeatable `global_fakelib_exclude=<TITLE_ID>` entries to skip the global fakelib for specific games without disabling per-game fakelib.
+- `backport_fakelib=0` disables the sandbox `fakelib` watcher, including global fakelib.
 - For `backport_fakelib` to work correctly, the standalone `BackPork` payload must be disabled. Running both at the same time will conflict.
 
 Kstuff game lifecycle behavior:

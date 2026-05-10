@@ -4,6 +4,7 @@
 #define IMAGE_MOUNT_BASE "/mnt/shadowmnt"
 
 #define DEFAULT_BACKPORTS_DIR_NAME "backports"
+#define DEFAULT_GLOBAL_FAKELIB_PATH "/data/shadowmount/fakelib"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
 #define LOG_FILE_PREV "/data/shadowmount/debug.log.1"

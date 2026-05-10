@@ -197,6 +197,22 @@ static void clear_scanner_config_reload_state(void) {
   g_scanner_config_probe_due_us = 0;
 }
 
+static bool fakelib_runtime_config_changed(const runtime_config_t *old_cfg,
+                                           const runtime_config_t *new_cfg) {
+  return old_cfg->backport_fakelib_enabled !=
+             new_cfg->backport_fakelib_enabled ||
+         old_cfg->global_fakelib_enabled != new_cfg->global_fakelib_enabled ||
+         old_cfg->global_fakelib_mount_first !=
+             new_cfg->global_fakelib_mount_first ||
+         strcmp(old_cfg->global_fakelib_path,
+                new_cfg->global_fakelib_path) != 0 ||
+         old_cfg->global_fakelib_exclude_title_count !=
+             new_cfg->global_fakelib_exclude_title_count ||
+         memcmp(old_cfg->global_fakelib_exclude_title_ids,
+                new_cfg->global_fakelib_exclude_title_ids,
+                sizeof(old_cfg->global_fakelib_exclude_title_ids)) != 0;
+}
+
 static size_t scanner_watch_fd_hash(uintptr_t ident) {
   return (size_t)((ident * 11400714819323198485ull) >>
                   (sizeof(uintptr_t) >= sizeof(uint64_t) ? 0 : 1));
@@ -772,7 +788,8 @@ static void reopen_config_file_watch(int kq, uint64_t now_us) {
 
 static void apply_runtime_config_reload_effects(const runtime_config_t *old_cfg,
                                                 const runtime_config_t *new_cfg) {
-  if (old_cfg->backport_fakelib_enabled && !new_cfg->backport_fakelib_enabled)
+  if (old_cfg->backport_fakelib_enabled &&
+      fakelib_runtime_config_changed(old_cfg, new_cfg))
     sm_fakelib_game_shutdown();
 
   sm_kstuff_on_config_reload();

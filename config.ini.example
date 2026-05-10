@@ -72,6 +72,24 @@
 # Default: 1
 # backport_fakelib=1
 
+# Global fakelib overlay:
+# 1/true/yes/on  -> also mount global fakelib for every tracked game when present
+# 0/false/no/off -> do not use the global fakelib folder
+# Default: 1
+# global_fakelib=1
+#
+# Default global fakelib folder:
+# global_fakelib_path=/data/shadowmount/fakelib
+#
+# Priority when both global and per-game fakelib exist:
+# game   -> mount global first, then game-specific fakelib (game wins)
+# global -> mount game-specific fakelib first, then global fakelib (global wins)
+# Default: game
+# global_fakelib_priority=game
+#
+## Exclude specific title IDs from the global fakelib overlay (repeatable):
+## global_fakelib_exclude=PPSA12345
+
 # Auto-manage kstuff around game launches:
 # 1/true/yes/on  -> pause kstuff after game launch, resume immediately on stop
 # 0/false/no/off -> leave kstuff state untouched

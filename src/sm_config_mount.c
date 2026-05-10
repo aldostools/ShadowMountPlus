@@ -66,11 +66,17 @@ static char *trim_ascii(char *s);
 static bool parse_ini_line(char *line, char **key_out, char **value_out);
 static bool normalize_title_id_value(const char *value,
                                      char out[MAX_TITLE_ID]);
+static bool normalize_absolute_path_value(const char *value,
+                                          char out[MAX_PATH]);
+static bool parse_global_fakelib_priority_ini(const char *value,
+                                              bool *mount_first_out);
 static config_load_status_t load_runtime_config_state(runtime_config_state_t *state);
 static bool parse_u32_ini(const char *value, uint32_t *out);
 static bool is_valid_sector_size(uint32_t size);
 static bool set_kstuff_pause_delay_override_rule(runtime_config_state_t *state,
                                                  const char *value);
+static bool add_global_fakelib_exclude_rule(runtime_config_state_t *state,
+                                            const char *value);
 static bool normalize_image_filename_value(const char *value,
                                            char out[MAX_PATH]);
 static bool set_image_sector_rule(runtime_config_state_t *state,
@@ -245,9 +251,13 @@ static void init_runtime_config_defaults(runtime_config_state_t *state) {
   state->cfg.app_install_all_enabled = false;
   state->cfg.app_install_all_forced = false;
   state->cfg.backport_fakelib_enabled = true;
+  state->cfg.global_fakelib_enabled = true;
+  state->cfg.global_fakelib_mount_first = true;
   state->cfg.kstuff_game_auto_toggle = true;
   state->cfg.kstuff_crash_detection_enabled = true;
   state->cfg.legacy_recursive_scan_forced = false;
+  (void)strlcpy(state->cfg.global_fakelib_path, DEFAULT_GLOBAL_FAKELIB_PATH,
+                sizeof(state->cfg.global_fakelib_path));
   state->cfg.scan_depth = DEFAULT_SCAN_DEPTH;
   state->cfg.scan_interval_us = DEFAULT_SCAN_INTERVAL_US;
   state->cfg.stability_wait_seconds = DEFAULT_STABILITY_WAIT_SECONDS;
@@ -303,6 +313,17 @@ static void apply_reloadable_runtime_fields(runtime_config_state_t *dst,
   dst->cfg.app_install_all_enabled = src->cfg.app_install_all_enabled;
   dst->cfg.app_install_all_forced = src->cfg.app_install_all_forced;
   dst->cfg.backport_fakelib_enabled = src->cfg.backport_fakelib_enabled;
+  dst->cfg.global_fakelib_enabled = src->cfg.global_fakelib_enabled;
+  dst->cfg.global_fakelib_mount_first =
+      src->cfg.global_fakelib_mount_first;
+  (void)strlcpy(dst->cfg.global_fakelib_path,
+                src->cfg.global_fakelib_path,
+                sizeof(dst->cfg.global_fakelib_path));
+  dst->cfg.global_fakelib_exclude_title_count =
+      src->cfg.global_fakelib_exclude_title_count;
+  memcpy(dst->cfg.global_fakelib_exclude_title_ids,
+         src->cfg.global_fakelib_exclude_title_ids,
+         sizeof(dst->cfg.global_fakelib_exclude_title_ids));
   dst->cfg.kstuff_game_auto_toggle = src->cfg.kstuff_game_auto_toggle;
   dst->cfg.kstuff_crash_detection_enabled =
       src->cfg.kstuff_crash_detection_enabled;
@@ -429,6 +450,22 @@ bool is_kstuff_pause_disabled_for_title(const char *title_id) {
   return false;
 }
 
+bool is_global_fakelib_excluded_for_title(const char *title_id) {
+  ensure_runtime_config_ready();
+
+  char normalized[MAX_TITLE_ID];
+  if (!normalize_title_id_value(title_id, normalized))
+    return false;
+
+  const runtime_config_t *cfg = runtime_config();
+  for (uint32_t i = 0; i < cfg->global_fakelib_exclude_title_count; ++i) {
+    if (strcmp(cfg->global_fakelib_exclude_title_ids[i], normalized) == 0)
+      return true;
+  }
+
+  return false;
+}
+
 bool get_kstuff_pause_delay_override_for_title(const char *title_id,
                                                uint32_t *delay_seconds_out) {
   ensure_runtime_config_ready();
@@ -544,6 +581,27 @@ static bool normalize_image_filename_value(const char *value,
   return true;
 }
 
+static bool normalize_absolute_path_value(const char *value,
+                                          char out[MAX_PATH]) {
+  if (!value || !out)
+    return false;
+
+  char local[MAX_PATH];
+  (void)strlcpy(local, value, sizeof(local));
+  char *trimmed = trim_ascii(local);
+  size_t len = strlen(trimmed);
+  if (len == 0 || len >= MAX_PATH || trimmed[0] != '/')
+    return false;
+
+  while (len > 1 && trimmed[len - 1] == '/') {
+    trimmed[len - 1] = '\0';
+    len--;
+  }
+
+  (void)strlcpy(out, trimmed, MAX_PATH);
+  return true;
+}
+
 static bool parse_bool_ini(const char *value, bool *out) {
   if (!value || !out)
     return false;
@@ -559,6 +617,24 @@ static bool parse_bool_ini(const char *value, bool *out) {
     *out = false;
     return true;
   }
+  return false;
+}
+
+static bool parse_global_fakelib_priority_ini(const char *value,
+                                              bool *mount_first_out) {
+  if (!value || !mount_first_out)
+    return false;
+
+  if (strcasecmp(value, "game") == 0) {
+    *mount_first_out = true;
+    return true;
+  }
+
+  if (strcasecmp(value, "global") == 0) {
+    *mount_first_out = false;
+    return true;
+  }
+
   return false;
 }
 
@@ -1033,6 +1109,30 @@ static bool add_kstuff_no_pause_title_rule(runtime_config_state_t *state,
   return true;
 }
 
+static bool add_global_fakelib_exclude_rule(runtime_config_state_t *state,
+                                            const char *value) {
+  char normalized[MAX_TITLE_ID];
+  if (!normalize_title_id_value(value, normalized))
+    return false;
+
+  for (uint32_t i = 0; i < state->cfg.global_fakelib_exclude_title_count;
+       ++i) {
+    if (strcmp(state->cfg.global_fakelib_exclude_title_ids[i], normalized) == 0)
+      return true;
+  }
+
+  if (state->cfg.global_fakelib_exclude_title_count >=
+      MAX_FAKELIB_EXCLUDE_RULES) {
+    return false;
+  }
+
+  uint32_t index = state->cfg.global_fakelib_exclude_title_count++;
+  (void)strlcpy(state->cfg.global_fakelib_exclude_title_ids[index],
+                normalized,
+                sizeof(state->cfg.global_fakelib_exclude_title_ids[index]));
+  return true;
+}
+
 static bool set_kstuff_pause_delay_override_rule(runtime_config_state_t *state,
                                                  const char *value) {
   if (!state || !value)
@@ -1195,6 +1295,47 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
         continue;
       }
       state->cfg.backport_fakelib_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "global_fakelib") == 0 ||
+        strcasecmp(key, "global_fakelib_enabled") == 0) {
+      if (!parse_bool_ini(value, &bval)) {
+        log_debug("  [CFG] invalid bool at line %d: %s=%s", line_no, key, value);
+        continue;
+      }
+      state->cfg.global_fakelib_enabled = bval;
+      continue;
+    }
+
+    if (strcasecmp(key, "global_fakelib_path") == 0) {
+      if (!normalize_absolute_path_value(value,
+                                         state->cfg.global_fakelib_path)) {
+        log_debug("  [CFG] invalid global fakelib path at line %d: %s=%s",
+                  line_no, key, value);
+        continue;
+      }
+      continue;
+    }
+
+    if (strcasecmp(key, "global_fakelib_priority") == 0) {
+      if (!parse_global_fakelib_priority_ini(
+              value, &state->cfg.global_fakelib_mount_first)) {
+        log_debug("  [CFG] invalid global fakelib priority at line %d: %s=%s "
+                  "(use game or global)",
+                  line_no, key, value);
+        continue;
+      }
+      continue;
+    }
+
+    if (strcasecmp(key, "global_fakelib_exclude") == 0 ||
+        strcasecmp(key, "global_fakelib_exclude_title") == 0) {
+      if (!add_global_fakelib_exclude_rule(state, value)) {
+        log_debug("  [CFG] invalid global fakelib exclude rule at line %d: "
+                  "%s=%s",
+                  line_no, key, value);
+      }
       continue;
     }
 
@@ -1377,6 +1518,8 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
   log_debug("  [CFG] loaded: debug=%d quiet=%d ro=%d force=%d "
             "app_install_all=%d app_install_all_forced=%d scan_depth=%u "
             "legacy_recursive_scan_forced=%d backport_fakelib=%d "
+            "global_fakelib=%d global_fakelib_priority=%s "
+            "global_fakelib_path=%s global_fakelib_exclude=%u "
             "kstuff_game_auto_toggle=%d kstuff_crash_detection=%d "
             "kstuff_pause_delay_image_s=%u kstuff_pause_delay_direct_s=%u "
             "exfat_backend=%s ufs_backend=%s "
@@ -1390,6 +1533,10 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
             state->cfg.app_install_all_forced ? 1 : 0, state->cfg.scan_depth,
             state->cfg.legacy_recursive_scan_forced ? 1 : 0,
             state->cfg.backport_fakelib_enabled ? 1 : 0,
+            state->cfg.global_fakelib_enabled ? 1 : 0,
+            state->cfg.global_fakelib_mount_first ? "game" : "global",
+            state->cfg.global_fakelib_path,
+            state->cfg.global_fakelib_exclude_title_count,
             state->cfg.kstuff_game_auto_toggle ? 1 : 0,
             state->cfg.kstuff_crash_detection_enabled ? 1 : 0,
             state->cfg.kstuff_pause_delay_image_seconds,

@@ -2,16 +2,24 @@
 
 #include "sm_fakelib.h"
 #include "sm_config_mount.h"
+#include "sm_filesystem.h"
 #include "sm_log.h"
 #include "sm_types.h"
 
 typedef struct {
-  bool active;
+  char source_path[MAX_PATH];
+  char mount_path[MAX_PATH];
+  const char *label;
+} fakelib_layer_t;
+
+typedef struct {
   pid_t pid;
   char mount_path[MAX_PATH];
-} fakelib_mount_t;
+  fakelib_layer_t layers[2];
+  size_t layer_count;
+} fakelib_session_t;
 
-static fakelib_mount_t g_fakelib_mount;
+static fakelib_session_t g_fakelib_mount;
 
 bool sm_fakelib_game_feature_enabled(void) {
   return runtime_config()->backport_fakelib_enabled;
@@ -19,7 +27,8 @@ bool sm_fakelib_game_feature_enabled(void) {
 
 static bool mount_fakelib_overlay(const char *title_id,
                                   const char *source_path,
-                                  const char *mount_path) {
+                                  const char *mount_path,
+                                  const char *label) {
   struct iovec overlay_iov[] = {
       IOVEC_ENTRY("fstype"), IOVEC_ENTRY("unionfs"),
       IOVEC_ENTRY("from"),   IOVEC_ENTRY(source_path),
@@ -29,31 +38,50 @@ static bool mount_fakelib_overlay(const char *title_id,
       IOVEC_ENTRY("fnodup"), IOVEC_ENTRY(NULL)};
 
   if (nmount(overlay_iov, IOVEC_SIZE(overlay_iov), 0) == 0) {
-    notify_system_info("Game backported: %s", title_id);
-    log_debug("  [FAKELIB] libraries mounted for %s: %s -> %s", title_id,
-              source_path, mount_path);
+    log_debug("  [FAKELIB] %s libraries mounted for %s: %s -> %s", label,
+              title_id, source_path, mount_path);
     return true;
   }
 
-  log_debug("  [FAKELIB] mount failed for %s (%s -> %s): %s", title_id,
-            source_path, mount_path, strerror(errno));
+  log_debug("  [FAKELIB] %s mount failed for %s (%s -> %s): %s", label,
+            title_id, source_path, mount_path, strerror(errno));
   return false;
 }
 
-static bool unmount_fakelib_overlay(const char *mount_path) {
+static bool unmount_fakelib_overlay(const fakelib_layer_t *layer) {
+  const char *mount_path = layer->mount_path;
   if (unmount(mount_path, MNT_FORCE) == 0 || errno == ENOENT ||
       errno == EINVAL) {
+    log_debug("  [FAKELIB] %s libraries unmounted: %s -> %s", layer->label,
+              layer->source_path, mount_path);
     return true;
   }
 
-  log_debug("  [FAKELIB] unmount failed for %s: %s", mount_path,
-            strerror(errno));
+  log_debug("  [FAKELIB] %s unmount failed for %s: %s", layer->label,
+            mount_path, strerror(errno));
   return false;
 }
 
-static bool resolve_sandbox_fakelib_context(const char *title_id,
-                                            char source_path[MAX_PATH],
-                                            char mount_path[MAX_PATH]) {
+static bool track_fakelib_overlay(const char *title_id,
+                                  const char *source_path,
+                                  const char *mount_path,
+                                  const char *label) {
+  if (!mount_fakelib_overlay(title_id, source_path, mount_path, label))
+    return false;
+
+  fakelib_layer_t *layer = &g_fakelib_mount.layers[g_fakelib_mount.layer_count++];
+  layer->label = label;
+  (void)strlcpy(layer->source_path, source_path, sizeof(layer->source_path));
+  (void)strlcpy(layer->mount_path, mount_path, sizeof(layer->mount_path));
+  return true;
+}
+
+static bool resolve_sandbox_context(const char *title_id,
+                                    char game_source_path[MAX_PATH],
+                                    char mount_path[MAX_PATH]) {
+  game_source_path[0] = '\0';
+  mount_path[0] = '\0';
+
   char sandbox_id[MAX_TITLE_ID];
   DIR *d = opendir("/mnt/sandbox");
   if (!d)
@@ -88,10 +116,12 @@ static bool resolve_sandbox_fakelib_context(const char *title_id,
   if (!found)
     return false;
 
-  snprintf(source_path, MAX_PATH, "/mnt/sandbox/%s/app0/fakelib", sandbox_id);
+  char source_path[MAX_PATH];
+  snprintf(source_path, sizeof(source_path), "/mnt/sandbox/%s/app0/fakelib",
+           sandbox_id);
   struct stat st;
-  if (stat(source_path, &st) != 0 || !S_ISDIR(st.st_mode))
-    return false;
+  if (stat(source_path, &st) == 0 && S_ISDIR(st.st_mode))
+    (void)strlcpy(game_source_path, source_path, MAX_PATH);
 
   char sandbox_root[MAX_PATH];
   snprintf(sandbox_root, sizeof(sandbox_root), "/mnt/sandbox/%s", sandbox_id);
@@ -119,12 +149,49 @@ static bool resolve_sandbox_fakelib_context(const char *title_id,
   return found;
 }
 
-static bool cleanup_fakelib_mount(void) {
-  if (!g_fakelib_mount.active)
-    return true;
+static bool resolve_global_fakelib_source(const char *title_id,
+                                          char source_path[MAX_PATH]) {
+  source_path[0] = '\0';
 
-  if (!unmount_fakelib_overlay(g_fakelib_mount.mount_path)) {
+  const runtime_config_t *cfg = runtime_config();
+  if (!cfg->global_fakelib_enabled)
     return false;
+  if (is_global_fakelib_excluded_for_title(title_id))
+    return false;
+
+  if (!read_mount_link(title_id, source_path, MAX_PATH))
+    return false;
+
+  struct stat st;
+  if (stat(cfg->global_fakelib_path, &st) != 0) {
+    if (errno != ENOENT)
+      log_debug("  [FAKELIB] global path unavailable for %s: %s (%s)",
+                title_id, cfg->global_fakelib_path, strerror(errno));
+    return false;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    log_debug("  [FAKELIB] global path is not a directory for %s: %s",
+              title_id, cfg->global_fakelib_path);
+    return false;
+  }
+
+  (void)strlcpy(source_path, cfg->global_fakelib_path, MAX_PATH);
+  return true;
+}
+
+static bool cleanup_fakelib_mount(void) {
+  if (g_fakelib_mount.layer_count == 0) {
+    memset(&g_fakelib_mount, 0, sizeof(g_fakelib_mount));
+    return true;
+  }
+
+  while (g_fakelib_mount.layer_count > 0) {
+    fakelib_layer_t *layer =
+        &g_fakelib_mount.layers[g_fakelib_mount.layer_count - 1];
+    if (!unmount_fakelib_overlay(layer))
+      return false;
+    memset(layer, 0, sizeof(*layer));
+    g_fakelib_mount.layer_count--;
   }
 
   memset(&g_fakelib_mount, 0, sizeof(g_fakelib_mount));
@@ -135,13 +202,13 @@ void sm_fakelib_game_on_exec(pid_t pid, const char *title_id) {
   if (!sm_fakelib_game_feature_enabled())
     return;
 
-  if (g_fakelib_mount.active && g_fakelib_mount.pid == pid) {
+  if (g_fakelib_mount.layer_count > 0 && g_fakelib_mount.pid == pid) {
     log_debug("  [FAKELIB] already tracking pid=%ld for %s", (long)pid,
               title_id);
     return;
   }
 
-  if (g_fakelib_mount.active && g_fakelib_mount.pid != pid) {
+  if (g_fakelib_mount.layer_count > 0 && g_fakelib_mount.pid != pid) {
     log_debug("  [FAKELIB] handoff active mount pid=%ld -> pid=%ld (%s)",
               (long)g_fakelib_mount.pid, (long)pid, title_id);
     if (!cleanup_fakelib_mount()) {
@@ -151,22 +218,57 @@ void sm_fakelib_game_on_exec(pid_t pid, const char *title_id) {
     }
   }
 
-  char source_path[MAX_PATH];
+  char game_source_path[MAX_PATH];
+  char global_source_path[MAX_PATH];
   char mount_path[MAX_PATH];
-  if (!resolve_sandbox_fakelib_context(title_id, source_path, mount_path))
+  if (!resolve_sandbox_context(title_id, game_source_path, mount_path))
     return;
 
-  if (!mount_fakelib_overlay(title_id, source_path, mount_path))
+  bool has_global =
+      resolve_global_fakelib_source(title_id, global_source_path);
+  bool has_game = (game_source_path[0] != '\0');
+  if (!has_global && !has_game)
     return;
 
-  g_fakelib_mount.active = true;
+  memset(&g_fakelib_mount, 0, sizeof(g_fakelib_mount));
   g_fakelib_mount.pid = pid;
   (void)strlcpy(g_fakelib_mount.mount_path, mount_path,
                 sizeof(g_fakelib_mount.mount_path));
+
+  bool global_first = runtime_config()->global_fakelib_mount_first;
+  bool same_source =
+      has_global && has_game &&
+      strcmp(global_source_path, game_source_path) == 0;
+  if (global_first && has_global && !same_source) {
+    if (!track_fakelib_overlay(title_id, global_source_path, mount_path,
+                               "global")) {
+      (void)cleanup_fakelib_mount();
+      return;
+    }
+  }
+
+  if (has_game) {
+    if (!track_fakelib_overlay(title_id, game_source_path, mount_path,
+                               "game")) {
+      (void)cleanup_fakelib_mount();
+      return;
+    }
+  }
+
+  if (!global_first && has_global && !same_source) {
+    if (!track_fakelib_overlay(title_id, global_source_path, mount_path,
+                               "global")) {
+      (void)cleanup_fakelib_mount();
+      return;
+    }
+  }
+
+  if (has_game)
+    notify_system_info("Game backported: %s", title_id);
 }
 
 void sm_fakelib_game_on_exit(pid_t pid) {
-  if (!g_fakelib_mount.active || g_fakelib_mount.pid != pid)
+  if (g_fakelib_mount.layer_count == 0 || g_fakelib_mount.pid != pid)
     return;
 
   log_debug("  [FAKELIB] game stopped: pid=%ld mount=%s", (long)pid,

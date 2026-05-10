@@ -39,5 +39,7 @@ bool upsert_kstuff_autotune_pause_delay(const char *title_id,
 bool upsert_image_sector_size_autotune(const char *filename,
                                        uint32_t sector_size,
                                        uint32_t *sector_size_out);
+// Return true when the global fakelib overlay is disabled for this title.
+bool is_global_fakelib_excluded_for_title(const char *title_id);
 
 #endif
